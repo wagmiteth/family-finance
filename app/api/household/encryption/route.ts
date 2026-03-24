@@ -1,8 +1,12 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 
-/** GET: Retrieve the invite-code-wrapped DEK for key exchange during join */
-export async function GET() {
+/** GET: Retrieve the invite-code-wrapped DEK for key exchange during join.
+ *  Supports two modes:
+ *  - ?invite=CODE — for joining users who don't have a household yet
+ *  - No params — for existing household members
+ */
+export async function GET(request: Request) {
   try {
     const supabase = await createClient();
     const {
@@ -13,13 +17,44 @@ export async function GET() {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
+    const url = new URL(request.url);
+    const inviteCode = url.searchParams.get("invite");
+
+    let householdId: string | null = null;
+
+    if (inviteCode) {
+      // Look up household by invite code (for joining users)
+      const { createAdminClient } = await import("@/lib/supabase/admin");
+      const admin = createAdminClient();
+      const { data: household } = await admin
+        .from("households")
+        .select("id, encrypted_dek, invite_code_salt")
+        .eq("invite_code", inviteCode.trim().toUpperCase())
+        .single();
+
+      if (!household) {
+        return NextResponse.json(
+          { error: "Household not found" },
+          { status: 404 }
+        );
+      }
+
+      return NextResponse.json({
+        encrypted_dek: household.encrypted_dek,
+        invite_code_salt: household.invite_code_salt,
+      });
+    }
+
+    // Existing member path
     const { data: appUser } = await supabase
       .from("users")
       .select("household_id")
       .eq("auth_id", authUser.id)
       .single();
 
-    if (!appUser?.household_id) {
+    householdId = appUser?.household_id ?? null;
+
+    if (!householdId) {
       return NextResponse.json(
         { error: "Household not found" },
         { status: 404 }
@@ -29,7 +64,7 @@ export async function GET() {
     const { data: household, error } = await supabase
       .from("households")
       .select("encrypted_dek, invite_code_salt")
-      .eq("id", appUser.household_id)
+      .eq("id", householdId)
       .single();
 
     if (error || !household) {

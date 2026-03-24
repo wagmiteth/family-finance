@@ -75,6 +75,18 @@ export async function GET() {
   }
 }
 
+/**
+ * Create a new household with encrypted data.
+ *
+ * The client must provide:
+ * - encrypted_household: encrypted { name }
+ * - encrypted_user: encrypted { name, avatar_url }
+ * - encrypted_categories: array of { encrypted_data, owner_user_id?, sort_order, is_system }
+ * - encrypted_merchant_rules: array of { encrypted_data, category_index?, priority, is_learned }
+ *
+ * category_index in merchant_rules refers to the index in encrypted_categories array,
+ * so the server can link the rule to the correct category after insert.
+ */
 export async function POST(request: Request) {
   try {
     const supabase = await createClient();
@@ -86,30 +98,30 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const { householdName, userName } = await request.json();
+    const body = await request.json();
 
-    const name =
-      typeof householdName === "string" && householdName.trim().length > 0
-        ? householdName.trim()
-        : "My Household";
+    if (typeof body.encrypted_household !== "string") {
+      return NextResponse.json(
+        { error: "encrypted_household is required" },
+        { status: 400 }
+      );
+    }
 
-    // Use admin client to bypass RLS for onboarding
+    if (typeof body.encrypted_user !== "string") {
+      return NextResponse.json(
+        { error: "encrypted_user is required" },
+        { status: 400 }
+      );
+    }
+
     const admin = createAdminClient();
 
-    // Check if user already has a profile
+    // Check if user already has a profile with a household
     const { data: existingUser } = await admin
       .from("users")
       .select()
       .eq("auth_id", authUser.id)
       .maybeSingle();
-
-    const displayName =
-      typeof userName === "string" && userName.trim().length > 0
-        ? userName.trim()
-        : existingUser?.name ||
-          authUser.user_metadata?.name ||
-          authUser.email?.split("@")[0] ||
-          "User";
 
     if (existingUser?.household_id) {
       return NextResponse.json(
@@ -118,17 +130,22 @@ export async function POST(request: Request) {
       );
     }
 
-    // Create household with invite code that expires in 7 days
+    // Create household
     const inviteCode = generateInviteCode();
     const inviteExpiresAt = new Date(
       Date.now() + 7 * 24 * 60 * 60 * 1000
     ).toISOString();
+
     const { data: household, error: householdError } = await admin
       .from("households")
       .insert({
-        name,
         invite_code: inviteCode,
         invite_expires_at: inviteExpiresAt,
+        encrypted_data: body.encrypted_household,
+        // Plaintext display fields for invite preview (visible to invite code holders)
+        invite_display_name: typeof body.invite_display_name === "string" ? body.invite_display_name : null,
+        invite_display_household: typeof body.invite_display_household === "string" ? body.invite_display_household : null,
+        invite_display_avatar: typeof body.invite_display_avatar === "string" ? body.invite_display_avatar : null,
       })
       .select()
       .single();
@@ -140,10 +157,11 @@ export async function POST(request: Request) {
       );
     }
 
+    // Create or update user
     const userPayload = {
       household_id: household.id,
       email: authUser.email,
-      name: displayName,
+      encrypted_data: body.encrypted_user,
     };
 
     const userQuery = existingUser
@@ -171,88 +189,64 @@ export async function POST(request: Request) {
       );
     }
 
-    // Create default categories
-    const defaultCategories = [
-      {
-        household_id: household.id,
-        name: "uncategorized",
-        display_name: "📋 Uncategorized",
-        split_type: "none",
-        color: "#9ca3af",
-        is_system: true,
-        sort_order: 0,
-      },
-      {
-        household_id: household.id,
-        name: "shared",
-        display_name: "🤝 Shared",
-        split_type: "equal",
-        color: "#2b9a8f",
-        is_system: true,
-        sort_order: 1,
-      },
-      {
-        household_id: household.id,
-        name: "private",
-        display_name: `👤 ${displayName} - Private`,
-        split_type: "full_payer",
-        owner_user_id: user.id,
-        color: "#4a7c59",
-        is_system: false,
-        sort_order: 2,
-      },
-      {
-        household_id: household.id,
-        name: "work",
-        display_name: `💼 ${displayName} - Work`,
-        split_type: "full_payer",
-        owner_user_id: user.id,
-        color: "#6a9e78",
-        is_system: false,
-        sort_order: 3,
-      },
-      {
-        household_id: household.id,
-        name: "exclude",
-        display_name: "🚫 Exclude",
-        split_type: "none",
-        color: "#78716c",
-        is_system: true,
-        sort_order: 4,
-      },
-      {
-        household_id: household.id,
-        name: "deleted",
-        display_name: "🗑️ Deleted",
-        split_type: "none",
-        color: "#dc2626",
-        is_system: true,
-        sort_order: 99,
-      },
-    ];
-
-    const { error: categoriesError } = await admin
-      .from("categories")
-      .insert(defaultCategories);
-
-    if (categoriesError) {
-      return NextResponse.json(
-        { error: "Failed to create default categories" },
-        { status: 500 }
+    // Create encrypted categories
+    if (Array.isArray(body.encrypted_categories)) {
+      const categoryRows = body.encrypted_categories.map(
+        (cat: {
+          encrypted_data: string;
+          owner_is_self?: boolean;
+          sort_order?: number;
+          is_system?: boolean;
+        }) => ({
+          household_id: household.id,
+          encrypted_data: cat.encrypted_data,
+          owner_user_id: cat.owner_is_self ? user.id : null,
+          sort_order: cat.sort_order ?? 0,
+          is_system: cat.is_system ?? false,
+        })
       );
+
+      const { data: insertedCategories, error: categoriesError } = await admin
+        .from("categories")
+        .insert(categoryRows)
+        .select("id");
+
+      if (categoriesError) {
+        return NextResponse.json(
+          { error: "Failed to create categories" },
+          { status: 500 }
+        );
+      }
+
+      // Create encrypted merchant rules (link to categories by index)
+      if (
+        Array.isArray(body.encrypted_merchant_rules) &&
+        insertedCategories
+      ) {
+        const ruleRows = body.encrypted_merchant_rules.map(
+          (rule: {
+            encrypted_data: string;
+            category_index?: number;
+            priority?: number;
+            is_learned?: boolean;
+          }) => ({
+            household_id: household.id,
+            encrypted_data: rule.encrypted_data,
+            category_id:
+              rule.category_index != null
+                ? insertedCategories[rule.category_index]?.id ?? null
+                : null,
+            priority: rule.priority ?? 0,
+            is_learned: rule.is_learned ?? false,
+          })
+        );
+
+        await admin.from("merchant_rules").insert(ruleRows);
+      }
     }
 
     // Create user_settings
-    const { error: settingsError } = await admin
-      .from("user_settings")
-      .insert({ user_id: user.id });
-
-    if (settingsError) {
-      return NextResponse.json(
-        { error: "Failed to create user settings" },
-        { status: 500 }
-      );
-    }
+    await admin.from("user_settings").insert({ user_id: user.id });
 
     return NextResponse.json({ household, user }, { status: 201 });
   } catch {

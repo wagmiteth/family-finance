@@ -27,6 +27,8 @@ import {
 } from "recharts";
 import type { Transaction, Category, User, Household } from "@/lib/types";
 import { useDecryptedFetch } from "@/lib/crypto/use-decrypted-fetch";
+import { decryptEntity, decryptEntities } from "@/lib/crypto/entity-crypto";
+import { getDEK } from "@/lib/crypto/key-store";
 import { InviteBanner } from "@/components/invite-banner";
 
 function formatCurrency(amount: number) {
@@ -78,12 +80,20 @@ export default function DashboardPage() {
         fetch("/api/household"),
       ]);
 
+      const dek = getDEK();
       setTransactions(txData as Transaction[]);
-      if (catRes.ok) setCategories(await catRes.json());
-      if (usersRes.ok) setUsers(await usersRes.json());
+      if (catRes.ok) {
+        const rawCats = await catRes.json();
+        setCategories(await decryptEntities(rawCats, dek) as unknown as Category[]);
+      }
+      if (usersRes.ok) {
+        const rawUsers = await usersRes.json();
+        setUsers(await decryptEntities(rawUsers, dek) as unknown as User[]);
+      }
       if (householdRes.ok) {
         const data = await householdRes.json();
-        setHousehold(data.household);
+        const decryptedHousehold = await decryptEntity(data.household, dek);
+        setHousehold(decryptedHousehold as unknown as Household);
       }
     } catch {
       // silent
@@ -111,10 +121,10 @@ export default function DashboardPage() {
   const user1 = users[0];
   const user2 = users[1];
 
-  const user1Paid = sharedTransactions
+  const user1PaidShared = sharedTransactions
     .filter((t) => t.user_id === user1?.id)
     .reduce((sum, t) => sum + Math.abs(t.amount), 0);
-  const user2Paid = sharedTransactions
+  const user2PaidShared = sharedTransactions
     .filter((t) => t.user_id === user2?.id)
     .reduce((sum, t) => sum + Math.abs(t.amount), 0);
 
@@ -125,6 +135,33 @@ export default function DashboardPage() {
     const ratio = (cat?.split_ratio ?? 50) / 100;
     user1Owes += Math.abs(t.amount) * ratio;
   }
+
+  // Cross-paid full_payer: someone paid for the other's private expense
+  const crossPaidTransactions = transactions.filter((t) => {
+    if (!t.category_id || !t.user_id) return false;
+    const cat = categoryById.get(t.category_id);
+    return (
+      cat?.split_type === "full_payer" &&
+      cat.owner_user_id != null &&
+      cat.owner_user_id !== t.user_id
+    );
+  });
+
+  const user1PaidCross = crossPaidTransactions
+    .filter((t) => t.user_id === user1?.id)
+    .reduce((sum, t) => sum + Math.abs(t.amount), 0);
+  const user2PaidCross = crossPaidTransactions
+    .filter((t) => t.user_id === user2?.id)
+    .reduce((sum, t) => sum + Math.abs(t.amount), 0);
+
+  // user1 paid for user2's private → user2 owes, and vice versa
+  const user2OwesFromCross = user1PaidCross;
+  const user1OwesFromCross = user2PaidCross;
+  user1Owes += user1OwesFromCross;
+
+  const user1Paid = user1PaidShared + user1PaidCross;
+  const user2Paid = user2PaidShared + user2PaidCross;
+
   const user1Net = user1Paid - user1Owes;
   const settlementFrom = user1Net < 0 ? user1 : user2;
   const settlementTo = user1Net < 0 ? user2 : user1;

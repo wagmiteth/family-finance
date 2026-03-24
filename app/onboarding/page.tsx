@@ -14,6 +14,12 @@ import {
   KDF_ITERATIONS,
 } from "@/lib/crypto/client-crypto";
 import { setDEK } from "@/lib/crypto/key-store";
+import {
+  encryptHousehold,
+  encryptUser,
+  encryptCategory,
+  encryptMerchantRule,
+} from "@/lib/crypto/entity-crypto";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -53,6 +59,23 @@ export default function OnboardingPage() {
 
   useEffect(() => {
     async function checkHousehold() {
+      // Get auth user metadata (has the name from sign-up)
+      const supabase = (await import("@/lib/supabase/client")).createClient();
+      const { data: { user: authUser } } = await supabase.auth.getUser();
+
+      if (!authUser) {
+        router.push("/login");
+        return;
+      }
+
+      // Use name from auth metadata, then email prefix as fallback
+      const authName = authUser.user_metadata?.name;
+      if (authName) {
+        setUserName(authName);
+      } else if (authUser.email) {
+        setUserName(authUser.email.split("@")[0]);
+      }
+
       const res = await fetch("/api/user");
 
       if (res.status === 401) {
@@ -62,7 +85,6 @@ export default function OnboardingPage() {
 
       if (res.ok) {
         const user = await res.json();
-        if (user.name) setUserName(user.name);
         if (user.household_id) {
           router.push("/dashboard");
           return;
@@ -113,17 +135,81 @@ export default function OnboardingPage() {
     setSubmitting(true);
 
     try {
-      const password = getPassword();
-      if (!password) {
+      const pw = getPassword();
+      if (!pw) {
         toast.error("Password is required to set up encryption");
         return;
       }
 
-      // 1. Create household via API
+      // 1. Generate DEK first — we need it to encrypt everything
+      const dek = await generateDEK();
+
+      // 2. Encrypt household name and user name with DEK
+      const displayName = userName || "User";
+      const encryptedHousehold = await encryptHousehold(
+        { name: householdName || "My Household" },
+        dek
+      );
+      const encryptedUser = await encryptUser(
+        { name: displayName, avatar_url: null },
+        dek
+      );
+
+      // 3. Encrypt default categories (emojis + high-contrast colors)
+      const defaultCategories = [
+        { name: "uncategorized", display_name: `📋 Uncategorized`, split_type: "none", color: "#6b7280", description: null, split_ratio: 50 },
+        { name: "shared", display_name: `🤝 Shared`, split_type: "equal", color: "#0ea5e9", description: null, split_ratio: 50 },
+        { name: "private", display_name: `👤 ${displayName} - Private`, split_type: "full_payer", color: "#8b5cf6", description: null, split_ratio: 50 },
+        { name: "work", display_name: `💼 ${displayName} - Work`, split_type: "full_payer", color: "#f59e0b", description: null, split_ratio: 50 },
+        { name: "exclude", display_name: `🚫 Exclude`, split_type: "none", color: "#94a3b8", description: null, split_ratio: 50 },
+        { name: "deleted", display_name: `🗑️ Deleted`, split_type: "none", color: "#ef4444", description: null, split_ratio: 50 },
+      ];
+
+      const encryptedCategories = await Promise.all(
+        defaultCategories.map(async (cat, i) => ({
+          encrypted_data: await encryptCategory(cat, dek),
+          owner_is_self: cat.split_type === "full_payer",
+          sort_order: i === 5 ? 99 : i,
+          is_system: [0, 1, 4, 5].includes(i),
+        }))
+      );
+
+      // 4. Encrypt default merchant rule (Transfer → Exclude, index 4)
+      const encryptedMerchantRules = [
+        {
+          encrypted_data: await encryptMerchantRule(
+            {
+              pattern: ".*",
+              rule_type: "auto_import",
+              match_transaction_type: "transfer",
+              merchant_name: null,
+              merchant_type: null,
+              amount_hint: null,
+              amount_max: null,
+              notes: "Default rule: exclude all transfers",
+            },
+            dek
+          ),
+          category_index: 4, // "exclude" category
+          priority: 100,
+          is_learned: false,
+        },
+      ];
+
+      // 5. Create household with all encrypted data
+      //    Also send plaintext display fields for the invite preview
+      //    (visible only to invite code holders — acceptable trade-off)
       const res = await fetch("/api/household", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ householdName }),
+        body: JSON.stringify({
+          encrypted_household: encryptedHousehold,
+          encrypted_user: encryptedUser,
+          encrypted_categories: encryptedCategories,
+          encrypted_merchant_rules: encryptedMerchantRules,
+          invite_display_name: displayName,
+          invite_display_household: householdName || "My Household",
+        }),
       });
 
       if (!res.ok) {
@@ -135,15 +221,12 @@ export default function OnboardingPage() {
       const data = await res.json();
       const code = data.household?.invite_code || "";
 
-      // 2. Generate DEK for the household
-      const dek = await generateDEK();
-
-      // 3. Wrap DEK with user's password-derived KEK
+      // 6. Wrap DEK with user's password-derived KEK
       const userSalt = generateSalt();
-      const userKEK = await deriveKEK(password, userSalt, KDF_ITERATIONS);
+      const userKEK = await deriveKEK(pw, userSalt, KDF_ITERATIONS);
       const wrappedDEK = await wrapDEK(dek, userKEK);
 
-      // 4. Store user key material
+      // 7. Store user key material
       await fetch("/api/user/key-material", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -154,7 +237,7 @@ export default function OnboardingPage() {
         }),
       });
 
-      // 5. Wrap DEK with invite-code-derived KEK for key exchange
+      // 8. Wrap DEK with invite-code-derived KEK for key exchange
       const inviteCodeSalt = generateSalt();
       const inviteCodeKEK = await deriveKEK(
         code,
@@ -163,7 +246,7 @@ export default function OnboardingPage() {
       );
       const inviteWrappedDEK = await wrapDEK(dek, inviteCodeKEK);
 
-      // 6. Store invite-code-wrapped DEK on the household
+      // 9. Store invite-code-wrapped DEK on the household
       await fetch("/api/household/encryption", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -173,7 +256,7 @@ export default function OnboardingPage() {
         }),
       });
 
-      // 7. Store DEK in session
+      // 10. Store DEK in session
       await setDEK(dek);
 
       // Clean up temporary password
@@ -181,7 +264,6 @@ export default function OnboardingPage() {
       localStorage.removeItem("ff_onboarding_pw_ts");
 
       setGeneratedCode(code);
-      setStep("create");
       toast.success("Household created!");
     } catch (err) {
       console.error("[handleCreate]", err);
@@ -196,31 +278,16 @@ export default function OnboardingPage() {
     setSubmitting(true);
 
     try {
-      const password = getPassword();
-      if (!password) {
+      const pw = getPassword();
+      if (!pw) {
         toast.error("Password is required to set up encryption");
         return;
       }
 
       const normalizedCode = inviteCode.trim().toUpperCase();
 
-      // 1. Join household via API
-      const res = await fetch("/api/household/join", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ inviteCode: normalizedCode }),
-      });
-
-      if (!res.ok) {
-        const data = await res.json();
-        toast.error(data.error || "Failed to join household");
-        return;
-      }
-
-      const joinData = await res.json();
-
-      // 2. Get the invite-code-wrapped DEK from the household
-      const encRes = await fetch("/api/household/encryption");
+      // 1. Get the invite-code-wrapped DEK FIRST (before joining)
+      const encRes = await fetch(`/api/household/encryption?invite=${normalizedCode}`);
       if (!encRes.ok) {
         toast.error("Failed to retrieve encryption keys");
         return;
@@ -233,7 +300,7 @@ export default function OnboardingPage() {
         return;
       }
 
-      // 3. Derive KEK from invite code and unwrap DEK
+      // 2. Derive KEK from invite code and unwrap DEK
       const inviteCodeSaltBytes = fromBase64(invite_code_salt);
       const inviteCodeKEK = await deriveKEK(
         normalizedCode,
@@ -243,12 +310,49 @@ export default function OnboardingPage() {
       const inviteWrappedBytes = fromBase64(encrypted_dek);
       const dek = await unwrapDEK(inviteWrappedBytes.buffer as ArrayBuffer, inviteCodeKEK);
 
-      // 4. Wrap DEK with user's own password-derived KEK
+      // 3. Encrypt user data and categories with the DEK
+      const displayName = userName || "User";
+      const encryptedUser = await encryptUser(
+        { name: displayName, avatar_url: null },
+        dek
+      );
+
+      const joinCategories = [
+        { name: "private", display_name: `👤 ${displayName} - Private`, split_type: "full_payer", color: "#ec4899", description: null, split_ratio: 50 },
+        { name: "work", display_name: `💼 ${displayName} - Work`, split_type: "full_payer", color: "#f97316", description: null, split_ratio: 50 },
+      ];
+
+      const encryptedCategories = await Promise.all(
+        joinCategories.map(async (cat, i) => ({
+          encrypted_data: await encryptCategory(cat, dek),
+          sort_order: 5 + i,
+          is_system: false,
+        }))
+      );
+
+      // 4. Join household with encrypted data
+      const res = await fetch("/api/household/join", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          inviteCode: normalizedCode,
+          encrypted_user: encryptedUser,
+          encrypted_categories: encryptedCategories,
+        }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json();
+        toast.error(data.error || "Failed to join household");
+        return;
+      }
+
+      // 5. Wrap DEK with user's own password-derived KEK
       const userSalt = generateSalt();
-      const userKEK = await deriveKEK(password, userSalt, KDF_ITERATIONS);
+      const userKEK = await deriveKEK(pw, userSalt, KDF_ITERATIONS);
       const wrappedDEK = await wrapDEK(dek, userKEK);
 
-      // 5. Store user key material
+      // 6. Store user key material
       await fetch("/api/user/key-material", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -259,12 +363,12 @@ export default function OnboardingPage() {
         }),
       });
 
-      // 6. Clear the invite-code-wrapped DEK (no longer needed)
+      // 7. Clear the invite-code-wrapped DEK (no longer needed)
       await fetch("/api/household/encryption", {
         method: "DELETE",
       });
 
-      // 7. Store DEK in session
+      // 8. Store DEK in session
       await setDEK(dek);
 
       // Clean up temporary password

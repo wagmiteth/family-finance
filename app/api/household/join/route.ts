@@ -13,8 +13,8 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const { inviteCode, userName } = await request.json();
-
+    const body = await request.json();
+    const inviteCode = body.inviteCode;
     const normalizedInviteCode =
       typeof inviteCode === "string" ? inviteCode.trim().toUpperCase() : "";
 
@@ -33,14 +33,6 @@ export async function POST(request: Request) {
       .eq("auth_id", authUser.id)
       .maybeSingle();
 
-    const displayName =
-      typeof userName === "string" && userName.trim().length > 0
-        ? userName.trim()
-        : existingUser?.name ||
-          authUser.user_metadata?.name ||
-          authUser.email?.split("@")[0] ||
-          "User";
-
     if (existingUser?.household_id) {
       return NextResponse.json(
         { error: "User already belongs to a household" },
@@ -56,14 +48,13 @@ export async function POST(request: Request) {
       .single();
 
     if (householdError || !household) {
-      // Return same error for not-found and expired to avoid leaking info
       return NextResponse.json(
         { error: "Invalid or expired invite code" },
         { status: 404 }
       );
     }
 
-    // Check if invite code has expired
+    // Check expiry
     if (household.invite_expires_at) {
       const expiresAt = new Date(household.invite_expires_at);
       if (expiresAt < new Date()) {
@@ -74,7 +65,7 @@ export async function POST(request: Request) {
       }
     }
 
-    // Check if invite code was already used
+    // Check if already used
     if (household.invite_used_at) {
       return NextResponse.json(
         { error: "This invite code has already been used" },
@@ -102,11 +93,15 @@ export async function POST(request: Request) {
       );
     }
 
-    const userPayload = {
+    // Create or update user — encrypted_data provided by client
+    const userPayload: Record<string, unknown> = {
       household_id: household.id,
       email: authUser.email,
-      name: displayName,
     };
+
+    if (typeof body.encrypted_user === "string") {
+      userPayload.encrypted_data = body.encrypted_user;
+    }
 
     const userQuery = existingUser
       ? admin
@@ -127,6 +122,7 @@ export async function POST(request: Request) {
     const { data: user, error: userError } = await userQuery;
 
     if (userError) {
+      console.error("[join] user create error:", userError);
       return NextResponse.json(
         { error: "Failed to create user profile" },
         { status: 500 }
@@ -139,52 +135,27 @@ export async function POST(request: Request) {
       .update({ invite_used_at: new Date().toISOString() })
       .eq("id", household.id);
 
-    // Create Private + Work categories for the joining user
-    const userCategories = [
-      {
-        household_id: household.id,
-        name: "private",
-        display_name: `👤 ${displayName} - Private`,
-        split_type: "full_payer",
-        owner_user_id: user.id,
-        color: "#b45a3c",
-        is_system: false,
-        sort_order: 5,
-      },
-      {
-        household_id: household.id,
-        name: "work",
-        display_name: `💼 ${displayName} - Work`,
-        split_type: "full_payer",
-        owner_user_id: user.id,
-        color: "#d4845a",
-        is_system: false,
-        sort_order: 6,
-      },
-    ];
-
-    const { error: categoriesError } = await admin
-      .from("categories")
-      .insert(userCategories);
-
-    if (categoriesError) {
-      return NextResponse.json(
-        { error: "Failed to create categories" },
-        { status: 500 }
+    // Create encrypted categories for the joining user (provided by client)
+    if (Array.isArray(body.encrypted_categories)) {
+      const categoryRows = body.encrypted_categories.map(
+        (cat: {
+          encrypted_data: string;
+          sort_order?: number;
+          is_system?: boolean;
+        }) => ({
+          household_id: household.id,
+          encrypted_data: cat.encrypted_data,
+          owner_user_id: user.id,
+          sort_order: cat.sort_order ?? 5,
+          is_system: cat.is_system ?? false,
+        })
       );
+
+      await admin.from("categories").insert(categoryRows);
     }
 
     // Create user_settings
-    const { error: settingsError } = await admin
-      .from("user_settings")
-      .insert({ user_id: user.id });
-
-    if (settingsError) {
-      return NextResponse.json(
-        { error: "Failed to create user settings" },
-        { status: 500 }
-      );
-    }
+    await admin.from("user_settings").insert({ user_id: user.id });
 
     return NextResponse.json({ household, user }, { status: 201 });
   } catch {

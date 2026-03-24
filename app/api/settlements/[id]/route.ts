@@ -27,92 +27,29 @@ export async function PATCH(
     }
 
     const body = await request.json();
+    const updates: Record<string, unknown> = {};
 
-    // Handle "adjustment acknowledged" — clears the settled snapshot to match current
-    if (body.acknowledge_adjustment) {
-      const { data: current } = await supabase
-        .from("settlements")
-        .select()
-        .eq("id", id)
-        .eq("household_id", appUser.household_id)
-        .single();
+    if ("is_settled" in body) updates.is_settled = !!body.is_settled;
+    if ("settled_at" in body) updates.settled_at = body.settled_at;
+    if ("encrypted_data" in body) updates.encrypted_data = body.encrypted_data;
 
-      if (!current) {
-        return NextResponse.json({ error: "Settlement not found" }, { status: 404 });
-      }
-
-      const { data: settlement, error } = await supabase
-        .from("settlements")
-        .update({
-          settled_amount: current.amount,
-          settled_from_user_id: current.from_user_id,
-          settled_to_user_id: current.to_user_id,
-        })
-        .eq("id", id)
-        .eq("household_id", appUser.household_id)
-        .select()
-        .single();
-
-      if (error) {
-        return NextResponse.json({ error: "Failed to update settlement" }, { status: 500 });
-      }
-
-      return NextResponse.json(settlement);
+    if (Object.keys(updates).length === 0) {
+      return NextResponse.json({ error: "No valid fields" }, { status: 400 });
     }
 
-    const { is_settled } = body;
-
-    // When marking as settled, snapshot the current amount and direction
-    if (is_settled) {
-      const { data: current } = await supabase
-        .from("settlements")
-        .select()
-        .eq("id", id)
-        .eq("household_id", appUser.household_id)
-        .single();
-
-      if (!current) {
-        return NextResponse.json({ error: "Settlement not found" }, { status: 404 });
-      }
-
-      const { data: settlement, error } = await supabase
-        .from("settlements")
-        .update({
-          is_settled: true,
-          settled_at: new Date().toISOString(),
-          settled_amount: current.amount,
-          settled_from_user_id: current.from_user_id,
-          settled_to_user_id: current.to_user_id,
-        })
-        .eq("id", id)
-        .eq("household_id", appUser.household_id)
-        .select()
-        .single();
-
-      if (error) {
-        return NextResponse.json({ error: "Failed to update settlement" }, { status: 500 });
-      }
-
-      return NextResponse.json(settlement);
-    }
-
-    // Marking as pending — clear snapshot
     const { data: settlement, error } = await supabase
       .from("settlements")
-      .update({
-        is_settled: false,
-        settled_at: null,
-        settled_amount: null,
-        settled_from_user_id: null,
-        settled_to_user_id: null,
-      })
+      .update(updates)
       .eq("id", id)
       .eq("household_id", appUser.household_id)
       .select()
       .single();
 
     if (error) {
-      return NextResponse.json({ error: "Failed to update settlement" }, { status: 500 });
+      return NextResponse.json(
+        { error: "Failed to update settlement" },
+        { status: 500 }
+      );
     }
 
     return NextResponse.json(settlement);

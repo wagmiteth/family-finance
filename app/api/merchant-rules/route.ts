@@ -64,11 +64,21 @@ export async function POST(request: Request) {
 
     const body = await request.json();
 
+    if (typeof body.encrypted_data !== "string") {
+      return NextResponse.json(
+        { error: "encrypted_data is required" },
+        { status: 400 }
+      );
+    }
+
     const { data: rule, error } = await supabase
       .from("merchant_rules")
       .insert({
-        ...body,
         household_id: appUser.household_id,
+        encrypted_data: body.encrypted_data,
+        category_id: body.category_id ?? null,
+        priority: body.priority ?? 0,
+        is_learned: body.is_learned ?? false,
       })
       .select()
       .single();
@@ -107,13 +117,21 @@ export async function PATCH(request: Request) {
       return NextResponse.json({ error: "User not found" }, { status: 404 });
     }
 
-    const { id, ...updates } = await request.json();
+    const body = await request.json();
+    const { id } = body;
 
     if (!id) {
-      return NextResponse.json(
-        { error: "id is required in body" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "id is required" }, { status: 400 });
+    }
+
+    const updates: Record<string, unknown> = {};
+    if ("encrypted_data" in body) updates.encrypted_data = body.encrypted_data;
+    if ("category_id" in body) updates.category_id = body.category_id;
+    if ("priority" in body) updates.priority = body.priority;
+    if ("is_learned" in body) updates.is_learned = body.is_learned;
+
+    if (Object.keys(updates).length === 0) {
+      return NextResponse.json({ error: "No valid fields" }, { status: 400 });
     }
 
     const { data: rule, error } = await supabase
@@ -159,12 +177,8 @@ export async function DELETE(request: NextRequest) {
     }
 
     const id = request.nextUrl.searchParams.get("id");
-
     if (!id) {
-      return NextResponse.json(
-        { error: "id query param is required" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "id query param is required" }, { status: 400 });
     }
 
     const { error } = await supabase

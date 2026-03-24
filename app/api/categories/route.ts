@@ -64,21 +64,21 @@ export async function POST(request: Request) {
 
     const body = await request.json();
 
-    if (body.split_ratio !== undefined) {
-      const ratio = Number(body.split_ratio);
-      if (!Number.isInteger(ratio) || ratio < 1 || ratio > 99) {
-        return NextResponse.json(
-          { error: "split_ratio must be between 1 and 99" },
-          { status: 400 }
-        );
-      }
+    if (typeof body.encrypted_data !== "string") {
+      return NextResponse.json(
+        { error: "encrypted_data is required" },
+        { status: 400 }
+      );
     }
 
     const { data: category, error } = await supabase
       .from("categories")
       .insert({
-        ...body,
         household_id: appUser.household_id,
+        owner_user_id: body.owner_user_id ?? null,
+        sort_order: body.sort_order ?? 0,
+        is_system: body.is_system ?? false,
+        encrypted_data: body.encrypted_data,
       })
       .select()
       .single();
@@ -119,7 +119,7 @@ export async function PATCH(request: Request) {
 
     const body = await request.json();
 
-    // Bulk sort_order update: { order: [{ id, sort_order }] }
+    // Bulk sort_order update
     if (body.order && Array.isArray(body.order)) {
       const updates = await Promise.all(
         body.order.map(
@@ -129,7 +129,7 @@ export async function PATCH(request: Request) {
               .update({ sort_order: item.sort_order })
               .eq("id", item.id)
               .eq("household_id", appUser.household_id);
-            return { id: item.id, error: error ? "Failed to update category" : undefined };
+            return { id: item.id, error: error ? "Failed" : undefined };
           }
         )
       );
@@ -145,24 +145,19 @@ export async function PATCH(request: Request) {
       return NextResponse.json({ success: true });
     }
 
-    // Single category update
-    if (body.split_ratio !== undefined) {
-      const ratio = Number(body.split_ratio);
-      if (!Number.isInteger(ratio) || ratio < 1 || ratio > 99) {
-        return NextResponse.json(
-          { error: "split_ratio must be between 1 and 99" },
-          { status: 400 }
-        );
-      }
+    // Single category update — only server-stored fields
+    const { id } = body;
+    if (!id) {
+      return NextResponse.json({ error: "id is required" }, { status: 400 });
     }
 
-    const { id, ...updates } = body;
+    const updates: Record<string, unknown> = {};
+    if ("owner_user_id" in body) updates.owner_user_id = body.owner_user_id;
+    if ("sort_order" in body) updates.sort_order = body.sort_order;
+    if ("encrypted_data" in body) updates.encrypted_data = body.encrypted_data;
 
-    if (!id) {
-      return NextResponse.json(
-        { error: "id is required in body" },
-        { status: 400 }
-      );
+    if (Object.keys(updates).length === 0) {
+      return NextResponse.json({ error: "No valid fields" }, { status: 400 });
     }
 
     const { data: category, error } = await supabase
@@ -208,15 +203,10 @@ export async function DELETE(request: NextRequest) {
     }
 
     const id = request.nextUrl.searchParams.get("id");
-
     if (!id) {
-      return NextResponse.json(
-        { error: "id query param is required" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "id query param is required" }, { status: 400 });
     }
 
-    // Check if system category
     const { data: category } = await supabase
       .from("categories")
       .select("is_system")
@@ -225,10 +215,7 @@ export async function DELETE(request: NextRequest) {
       .single();
 
     if (!category) {
-      return NextResponse.json(
-        { error: "Category not found" },
-        { status: 404 }
-      );
+      return NextResponse.json({ error: "Category not found" }, { status: 404 });
     }
 
     if (category.is_system) {

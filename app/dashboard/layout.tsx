@@ -36,7 +36,7 @@ export default async function DashboardLayout({
   return (
     <DashboardShell
       user={userData}
-      householdName={household?.name || "Household"}
+      householdEncryptedData={household?.encrypted_data || null}
     >
       <EncryptionGate>
         {children}

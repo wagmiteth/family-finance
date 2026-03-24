@@ -23,6 +23,8 @@ import {
 import { toast } from "sonner";
 import type { Settlement, User, Transaction, Category } from "@/lib/types";
 import { useDecryptedFetch } from "@/lib/crypto/use-decrypted-fetch";
+import { decryptEntities } from "@/lib/crypto/entity-crypto";
+import { getDEK } from "@/lib/crypto/key-store";
 
 function formatCurrency(amount: number) {
   return Math.abs(amount).toLocaleString("sv-SE", {
@@ -136,7 +138,8 @@ function SettlementCard({
     ? getAdjustment(previousSettlement, users)
     : null;
 
-  // Get shared category IDs
+  // Get shared and cross-paid category IDs
+  const categoryById = new Map(categories.map((c) => [c.id, c]));
   const sharedCategoryIds = new Set(
     categories.filter((c) => c.split_type === "equal").map((c) => c.id)
   );
@@ -154,10 +157,19 @@ function SettlementCard({
     try {
       const monthStr = settlement.month.slice(0, 7);
       const allTx = await fetchDecrypted(`/api/transactions?month=${monthStr}`) as Transaction[];
-      const sharedTx = allTx.filter(
-        (t) => t.category_id && sharedCategoryIds.has(t.category_id)
-      );
-      setTransactions(sharedTx);
+      // Include shared (equal) + cross-paid (full_payer where payer ≠ owner)
+      const settlementTx = allTx.filter((t) => {
+        if (!t.category_id) return false;
+        if (sharedCategoryIds.has(t.category_id)) return true;
+        const cat = categoryById.get(t.category_id);
+        return (
+          cat?.split_type === "full_payer" &&
+          cat.owner_user_id != null &&
+          t.user_id != null &&
+          cat.owner_user_id !== t.user_id
+        );
+      });
+      setTransactions(settlementTx);
     } catch {
       setTransactions([]);
     } finally {
@@ -414,9 +426,19 @@ export default function SettlementsPage() {
         fetch("/api/users"),
       ]);
 
-      if (settRes.ok) setSettlements(await settRes.json());
-      if (catRes.ok) setCategories(await catRes.json());
-      if (usersRes.ok) setUsers(await usersRes.json());
+      const dek = getDEK();
+      if (settRes.ok) {
+        const rawSett = await settRes.json();
+        setSettlements(await decryptEntities(rawSett, dek) as unknown as Settlement[]);
+      }
+      if (catRes.ok) {
+        const rawCats = await catRes.json();
+        setCategories(await decryptEntities(rawCats, dek) as unknown as Category[]);
+      }
+      if (usersRes.ok) {
+        const rawUsers = await usersRes.json();
+        setUsers(await decryptEntities(rawUsers, dek) as unknown as User[]);
+      }
     } catch {
       // silent
     } finally {

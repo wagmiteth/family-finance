@@ -2,7 +2,6 @@
 
 import { usePathname } from "next/navigation";
 import Link from "next/link";
-import type { User } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
@@ -21,7 +20,10 @@ import {
   Settings,
   Menu,
 } from "lucide-react";
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { decryptEntity } from "@/lib/crypto/entity-crypto";
+import { getDEK } from "@/lib/crypto/key-store";
+import { useEncryption } from "@/lib/crypto/encryption-context";
 
 const navItems = [
   { href: "/dashboard", label: "Overview", icon: LayoutDashboard },
@@ -33,18 +35,18 @@ const navItems = [
 
 function NavLinks({
   pathname,
-  onNavigate,
   direction = "horizontal",
+  onNavigate,
 }: {
   pathname: string;
-  onNavigate?: () => void;
   direction?: "horizontal" | "vertical";
+  onNavigate?: () => void;
 }) {
   return (
     <nav
       className={cn(
-        "flex gap-0.5",
-        direction === "vertical" ? "flex-col" : "flex-row items-center"
+        "flex gap-1",
+        direction === "vertical" ? "flex-col" : "items-center"
       )}
     >
       {navItems.map((item) => {
@@ -52,20 +54,20 @@ function NavLinks({
           item.href === "/dashboard"
             ? pathname === "/dashboard"
             : pathname.startsWith(item.href);
+
         return (
           <Link
             key={item.href}
             href={item.href}
             onClick={onNavigate}
             className={cn(
-              "flex items-center gap-2 rounded-md px-3 py-2 text-[13px] font-medium transition-colors",
-              direction === "vertical" && "w-full",
+              "flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors",
               isActive
-                ? "bg-accent text-foreground"
-                : "text-muted-foreground hover:text-foreground hover:bg-accent/50"
+                ? "bg-primary/10 text-primary"
+                : "text-muted-foreground hover:bg-accent hover:text-foreground"
             )}
           >
-            <item.icon className="h-4 w-4" strokeWidth={1.5} />
+            <item.icon className="h-4 w-4" />
             {item.label}
           </Link>
         );
@@ -75,17 +77,50 @@ function NavLinks({
 }
 
 export function DashboardShell({
-  user,
-  householdName,
+  user: rawUser,
+  householdEncryptedData,
   children,
 }: {
-  user: User;
-  householdName: string;
+  user: Record<string, unknown>;
+  householdEncryptedData: string | null;
   children: React.ReactNode;
 }) {
   const pathname = usePathname();
   const [mobileOpen, setMobileOpen] = useState(false);
-  const initials = (user.name || user.email)
+  const { isUnlocked } = useEncryption();
+
+  // Decrypted state
+  const [userName, setUserName] = useState(rawUser.email as string || "");
+  const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
+  const [householdName, setHouseholdName] = useState("Household");
+
+  useEffect(() => {
+    async function decrypt() {
+      const dek = getDEK();
+      if (!dek) return;
+
+      // Decrypt user
+      try {
+        const decryptedUser = await decryptEntity(rawUser as Record<string, unknown> & { encrypted_data?: string | null }, dek);
+        if (decryptedUser.name) setUserName(decryptedUser.name as string);
+        if (decryptedUser.avatar_url) setAvatarUrl(decryptedUser.avatar_url as string);
+      } catch { /* ignore */ }
+
+      // Decrypt household
+      if (householdEncryptedData) {
+        try {
+          const decryptedHousehold = await decryptEntity(
+            { encrypted_data: householdEncryptedData } as Record<string, unknown> & { encrypted_data: string },
+            dek
+          );
+          if (decryptedHousehold.name) setHouseholdName(decryptedHousehold.name as string);
+        } catch { /* ignore */ }
+      }
+    }
+    decrypt();
+  }, [rawUser, householdEncryptedData, isUnlocked]);
+
+  const initials = userName
     .split(" ")
     .map((s) => s[0])
     .join("")
@@ -152,7 +187,7 @@ export function DashboardShell({
             )}
           >
             <Avatar className="h-8 w-8">
-              {user.avatar_url && <AvatarImage src={user.avatar_url} />}
+              {avatarUrl && <AvatarImage src={avatarUrl} />}
               <AvatarFallback className="text-[10px] font-semibold">
                 {initials}
               </AvatarFallback>

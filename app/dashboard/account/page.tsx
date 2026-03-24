@@ -27,6 +27,8 @@ import {
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Download, Trash2, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
+import { decryptEntity, encryptUser } from "@/lib/crypto/entity-crypto";
+import { getDEK } from "@/lib/crypto/key-store";
 import type { User, Transaction } from "@/lib/types";
 
 export default function AccountPage() {
@@ -56,9 +58,11 @@ export default function AccountPage() {
   const fetchProfile = useCallback(async () => {
     const res = await fetch("/api/user");
     if (res.ok) {
-      const data = await res.json();
-      setUser(data);
-      setName(data.name || "");
+      const raw = await res.json();
+      const dek = getDEK();
+      const decrypted = await decryptEntity(raw, dek);
+      setUser(decrypted as unknown as User);
+      setName((decrypted as Record<string, unknown>).name as string || "");
     }
   }, []);
 
@@ -69,14 +73,20 @@ export default function AccountPage() {
   async function handleSaveName() {
     setSaving(true);
     try {
+      const encrypted_data = await encryptUser({
+        name,
+        avatar_url: user?.avatar_url ?? null,
+      });
       const res = await fetch("/api/user", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name }),
+        body: JSON.stringify({ encrypted_data }),
       });
       if (res.ok) {
-        const updated = await res.json();
-        setUser(updated);
+        const raw = await res.json();
+        const dek = getDEK();
+        const decrypted = await decryptEntity(raw, dek);
+        setUser(decrypted as unknown as User);
         toast.success("Name updated");
       } else {
         toast.error("Failed to update name");
@@ -93,19 +103,48 @@ export default function AccountPage() {
     if (!file) return;
     setUploading(true);
     try {
+      // 1. Upload file to storage
       const formData = new FormData();
       formData.append("avatar", file);
-      const res = await fetch("/api/user/avatar", {
+      const uploadRes = await fetch("/api/user/avatar", {
         method: "POST",
         body: formData,
       });
-      if (res.ok) {
-        const data = await res.json();
-        setUser(data.user);
+      if (!uploadRes.ok) {
+        toast.error("Failed to upload avatar");
+        return;
+      }
+      const { avatar_url } = await uploadRes.json();
+
+      // 2. Encrypt updated user data with new avatar URL
+      const encrypted_data = await encryptUser({
+        name: name || user?.name || "",
+        avatar_url,
+      });
+
+      // 3. Save encrypted data
+      const saveRes = await fetch("/api/user", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ encrypted_data }),
+      });
+
+      // 4. Also update the invite display avatar (plaintext, for invite preview)
+      await fetch("/api/household/invite-display", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ invite_display_avatar: avatar_url }),
+      });
+
+      if (saveRes.ok) {
+        const raw = await saveRes.json();
+        const dek = getDEK();
+        const decrypted = await decryptEntity(raw, dek);
+        setUser(decrypted as unknown as User);
         router.refresh();
         toast.success("Avatar updated");
       } else {
-        toast.error("Failed to upload avatar");
+        toast.error("Failed to save avatar");
       }
     } catch {
       toast.error("Failed to upload avatar");

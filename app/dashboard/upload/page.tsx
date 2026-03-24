@@ -3,7 +3,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { parseFiles } from "@/lib/transactions/parser";
-import { encryptForApi } from "@/lib/crypto/use-decrypted-fetch";
+import { autoCategorizeImport } from "@/lib/transactions/categorizer";
+import { encryptTransaction, encryptFields, decryptEntities, decryptEntity } from "@/lib/crypto/entity-crypto";
+import { getDEK } from "@/lib/crypto/key-store";
+import { generateImportHash } from "@/lib/transactions/dedup";
 import { hasDEK } from "@/lib/crypto/key-store";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -34,6 +37,9 @@ import {
   Download,
   Zap,
   FileSpreadsheet,
+  Trash2,
+  History,
+  Loader2,
 } from "lucide-react";
 import { toast } from "sonner";
 import type {
@@ -41,8 +47,21 @@ import type {
   FileParseResult,
   AccountMetadata,
   User,
+  MerchantRule,
   FileFormat,
 } from "@/lib/types";
+
+interface UploadBatch {
+  id: string;
+  file_names?: string[];
+  transaction_count: number;
+  duplicate_count: number;
+  source: string | null;
+  created_at: string;
+  user_id: string | null;
+  uploaded_by: string | null;
+  encrypted_data?: string | null;
+}
 
 function formatCurrency(amount: number) {
   return amount.toLocaleString("sv-SE", {
@@ -88,9 +107,15 @@ export default function UploadPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [fileResults, setFileResults] = useState<FileParseResult[]>([]);
   const [users, setUsers] = useState<User[]>([]);
+  const [merchantRules, setMerchantRules] = useState<MerchantRule[]>([]);
+  const merchantRulesRef = useRef<MerchantRule[]>([]);
   const [selectedUserId, setSelectedUserId] = useState<string>("");
+  const [householdId, setHouseholdId] = useState<string>("");
   const [isDragOver, setIsDragOver] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [batches, setBatches] = useState<UploadBatch[]>([]);
+  const [loadingBatches, setLoadingBatches] = useState(true);
+  const [deletingBatchId, setDeletingBatchId] = useState<string | null>(null);
 
   // Derived state
   const allTransactions = fileResults.flatMap((r) => r.transactions);
@@ -111,18 +136,30 @@ export default function UploadPage() {
   useEffect(() => {
     async function fetchUsers() {
       try {
-        const [usersRes, userRes] = await Promise.all([
+        const dek = getDEK();
+        const [usersRes, userRes, rulesRes] = await Promise.all([
           fetch("/api/users"),
           fetch("/api/user"),
+          fetch("/api/merchant-rules"),
         ]);
 
         if (usersRes.ok) {
-          setUsers((await usersRes.json()) as User[]);
+          const rawUsers = await usersRes.json();
+          setUsers(await decryptEntities(rawUsers, dek) as unknown as User[]);
         }
 
         if (userRes.ok) {
-          const currentUser = (await userRes.json()) as User;
+          const rawUser = await userRes.json();
+          const currentUser = await decryptEntity(rawUser, dek) as unknown as User;
           setSelectedUserId(currentUser.id);
+          if (rawUser.household_id) setHouseholdId(rawUser.household_id);
+        }
+
+        if (rulesRes.ok) {
+          const rawRules = await rulesRes.json();
+          const rules = await decryptEntities(rawRules, dek) as unknown as MerchantRule[];
+          setMerchantRules(rules);
+          merchantRulesRef.current = rules;
         }
       } catch {
         toast.error("Failed to load household members");
@@ -131,6 +168,70 @@ export default function UploadPage() {
 
     fetchUsers();
   }, []);
+
+  useEffect(() => {
+    async function fetchBatches() {
+      try {
+        const dek = getDEK();
+        const res = await fetch("/api/upload-batches");
+        if (res.ok) {
+          const rawBatches = await res.json();
+          const decrypted = await decryptEntities(rawBatches, dek);
+          setBatches(decrypted as unknown as UploadBatch[]);
+        }
+      } catch {
+        // silent — non-critical
+      } finally {
+        setLoadingBatches(false);
+      }
+    }
+    fetchBatches();
+  }, []);
+
+  // Re-run auto-categorization when merchant rules load after files are already parsed
+  useEffect(() => {
+    if (merchantRules.length === 0 || fileResults.length === 0) return;
+
+    setFileResults((prev) =>
+      prev.map((result) => ({
+        ...result,
+        transactions: result.transactions.map((t) => ({
+          ...t,
+          autoCategory:
+            t.autoCategory ??
+            autoCategorizeImport(
+              t.description || "",
+              t.amount,
+              t.transaction_type || null,
+              merchantRules
+            ),
+        })),
+      }))
+    );
+  }, [merchantRules]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function handleDeleteBatch(batchId: string) {
+    if (!confirm("Delete this upload and all its transactions? This cannot be undone.")) {
+      return;
+    }
+    setDeletingBatchId(batchId);
+    try {
+      const res = await fetch(`/api/upload-batches/${batchId}`, {
+        method: "DELETE",
+      });
+      if (res.ok) {
+        setBatches((prev) => prev.filter((b) => b.id !== batchId));
+        toast.success("Upload batch deleted");
+      } else {
+        const data = await res.json();
+        toast.error(data.error || "Failed to delete batch");
+      }
+    } catch {
+      toast.error("Failed to delete batch");
+    } finally {
+      setDeletingBatchId(null);
+    }
+  }
 
   const handleFiles = useCallback((files: File[]) => {
     const validFiles = files.filter(
@@ -185,6 +286,23 @@ export default function UploadPage() {
         if (totalTx === 0 && metadataFiles.length === 0) {
           toast.error("No transactions found in uploaded files");
           return;
+        }
+
+        // Auto-categorize transactions using decrypted merchant rules
+        const rules = merchantRulesRef.current;
+        if (rules.length > 0) {
+          for (const result of results) {
+            for (const t of result.transactions) {
+              if (!t.autoCategory) {
+                t.autoCategory = autoCategorizeImport(
+                  t.description || "",
+                  t.amount,
+                  t.transaction_type || null,
+                  rules
+                );
+              }
+            }
+          }
         }
 
         setFileResults(results);
@@ -251,14 +369,31 @@ export default function UploadPage() {
 
     setImporting(true);
     try {
-      let txPayload = newTransactions;
-      if (hasDEK()) {
-        txPayload = (await Promise.all(
-          newTransactions.map((t) =>
-            encryptForApi(t as unknown as Record<string, unknown>)
-          )
-        )) as unknown as typeof newTransactions;
-      }
+      // Generate import hashes and encrypt each transaction
+      const txPayload = await Promise.all(
+        newTransactions.map(async (t) => {
+          const import_hash = t.import_hash || await generateImportHash(
+            householdId,
+            t.date,
+            t.amount,
+            t.description || "encrypted"
+          );
+          const encrypted_data = await encryptTransaction(
+            t as unknown as Record<string, unknown>
+          );
+          return {
+            encrypted_data,
+            import_hash,
+            category_id: t.autoCategory ?? null,
+          };
+        })
+      );
+
+      // Encrypt batch metadata (file names)
+      const encrypted_batch = await encryptFields(
+        { file_names: fileResults.map((r) => r.fileName) },
+        ["file_names"]
+      );
 
       const res = await fetch("/api/transactions/bulk", {
         method: "POST",
@@ -266,6 +401,7 @@ export default function UploadPage() {
         body: JSON.stringify({
           transactions: txPayload,
           user_id: selectedUserId,
+          encrypted_batch,
         }),
       });
 
@@ -658,6 +794,99 @@ export default function UploadPage() {
           )}
         </>
       )}
+
+      {/* Upload History */}
+      <Card>
+        <CardHeader className="pb-3">
+          <div className="flex items-center gap-2">
+            <History className="h-4 w-4 text-muted-foreground" />
+            <CardTitle className="text-base">Upload History</CardTitle>
+          </div>
+        </CardHeader>
+        <CardContent>
+          {loadingBatches ? (
+            <div className="flex items-center justify-center py-8 text-muted-foreground">
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              Loading...
+            </div>
+          ) : batches.length === 0 ? (
+            <p className="py-4 text-center text-sm text-muted-foreground">
+              No upload history yet
+            </p>
+          ) : (
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Date</TableHead>
+                    <TableHead>Files</TableHead>
+                    <TableHead>Payer</TableHead>
+                    <TableHead className="text-right">Imported</TableHead>
+                    <TableHead className="text-right">Duplicates</TableHead>
+                    <TableHead>Uploaded By</TableHead>
+                    <TableHead className="w-[60px]" />
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {batches.map((batch) => (
+                    <TableRow key={batch.id}>
+                      <TableCell className="whitespace-nowrap text-sm">
+                        {new Date(batch.created_at).toLocaleDateString("sv-SE")}{" "}
+                        <span className="text-muted-foreground">
+                          {new Date(batch.created_at).toLocaleTimeString("sv-SE", {
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          })}
+                        </span>
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex flex-wrap gap-1">
+                          {batch.file_names && batch.file_names.length > 0 ? (
+                            batch.file_names.map((fname: string, i: number) => (
+                              <Badge key={i} variant="outline" className="text-xs">
+                                {fname}
+                              </Badge>
+                            ))
+                          ) : (
+                            <span className="text-xs text-muted-foreground">—</span>
+                          )}
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-sm">
+                        {users.find((u) => u.id === batch.user_id)?.name || "—"}
+                      </TableCell>
+                      <TableCell className="text-right font-mono text-sm">
+                        {batch.transaction_count}
+                      </TableCell>
+                      <TableCell className="text-right font-mono text-sm text-muted-foreground">
+                        {batch.duplicate_count}
+                      </TableCell>
+                      <TableCell className="text-sm text-muted-foreground">
+                        {users.find((u) => u.id === batch.uploaded_by)?.name || "—"}
+                      </TableCell>
+                      <TableCell>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-8 w-8 text-muted-foreground hover:text-destructive"
+                          disabled={deletingBatchId === batch.id}
+                          onClick={() => handleDeleteBatch(batch.id)}
+                        >
+                          {deletingBatchId === batch.id ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Trash2 className="h-4 w-4" />
+                          )}
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
 }

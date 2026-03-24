@@ -10,8 +10,8 @@ import { EncryptionUnlockModal } from "@/components/encryption-unlock-modal";
  * (i.e. they set up client-side encryption) but the DEK
  * is not currently in session.
  *
- * Legacy users (no key material) see no modal — their data
- * is decrypted server-side (encryption_version = 0).
+ * Users without key material see no modal — they need to
+ * set up encryption first.
  */
 export function EncryptionGate({ children }: { children: ReactNode }) {
   const { isUnlocked, isRestoring, hasKeyMaterial } = useEncryption();

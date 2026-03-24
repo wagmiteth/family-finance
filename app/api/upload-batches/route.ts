@@ -14,33 +14,32 @@ export async function GET() {
 
     const { data: appUser } = await supabase
       .from("users")
-      .select("id, household_id")
+      .select()
       .eq("auth_id", authUser.id)
       .single();
 
-    if (!appUser?.household_id) {
+    if (!appUser) {
       return NextResponse.json({ error: "User not found" }, { status: 404 });
     }
 
-    // Return raw encrypted rows — client decrypts
-    const { data: transactions, error } = await supabase
-      .from("transactions")
-      .select()
+    // Return raw batches — user names are encrypted, client joins them
+    const { data: batches, error } = await supabase
+      .from("upload_batches")
+      .select("*")
       .eq("household_id", appUser.household_id)
       .order("created_at", { ascending: false });
 
     if (error) {
+      console.error("[upload-batches GET]", error);
       return NextResponse.json(
-        { error: "Failed to export data" },
+        { error: "Failed to fetch upload history" },
         { status: 500 }
       );
     }
 
-    return NextResponse.json({
-      transactions: transactions ?? [],
-      exported_at: new Date().toISOString(),
-    });
-  } catch {
+    return NextResponse.json(batches);
+  } catch (err) {
+    console.error("[upload-batches GET]", err);
     return NextResponse.json(
       { error: "Internal server error" },
       { status: 500 }

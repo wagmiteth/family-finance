@@ -65,6 +65,8 @@ import type {
   Transaction,
 } from "@/lib/types";
 import { useDecryptedFetch } from "@/lib/crypto/use-decrypted-fetch";
+import { decryptEntity, decryptEntities, encryptCategory, encryptMerchantRule } from "@/lib/crypto/entity-crypto";
+import { getDEK } from "@/lib/crypto/key-store";
 import { InviteBanner } from "@/components/invite-banner";
 
 export default function SettingsPage() {
@@ -107,11 +109,18 @@ function HouseholdTab() {
       fetch("/api/household"),
     ]);
 
-    if (userRes.ok) setUser(await userRes.json());
+    const dek = getDEK();
+    if (userRes.ok) {
+      const raw = await userRes.json();
+      const decrypted = await decryptEntity(raw, dek);
+      setUser(decrypted as unknown as User);
+    }
     if (householdRes.ok) {
       const data = await householdRes.json();
-      setHousehold(data.household);
-      setMembers(data.members || []);
+      const decryptedHousehold = await decryptEntity(data.household, dek);
+      setHousehold(decryptedHousehold as unknown as Household);
+      const decryptedMembers = await decryptEntities(data.members || [], dek);
+      setMembers(decryptedMembers as unknown as User[]);
     }
   }, []);
 
@@ -202,12 +211,19 @@ function CategoriesTab() {
 
   const fetchCategories = useCallback(async () => {
     setLoading(true);
+    const dek = getDEK();
     const [catRes, usersRes] = await Promise.all([
       fetch("/api/categories"),
       fetch("/api/users"),
     ]);
-    if (catRes.ok) setCategories(await catRes.json());
-    if (usersRes.ok) setMembers(await usersRes.json());
+    if (catRes.ok) {
+      const raw = await catRes.json();
+      setCategories(await decryptEntities(raw, dek) as unknown as Category[]);
+    }
+    if (usersRes.ok) {
+      const raw = await usersRes.json();
+      setMembers(await decryptEntities(raw, dek) as unknown as User[]);
+    }
     setLoading(false);
   }, []);
 
@@ -226,9 +242,9 @@ function CategoriesTab() {
   }
 
   const defaultColors = [
-    "#4a7c59", "#6a9e78", "#2b9a8f", "#3b82f6",
-    "#b45a3c", "#d4845a", "#9ca3af", "#78716c",
-    "#7c5cbf", "#e25d7d", "#d4a843", "#5a8faa",
+    "#0ea5e9", "#3b82f6", "#8b5cf6", "#ec4899",
+    "#ef4444", "#f97316", "#f59e0b", "#22c55e",
+    "#14b8a6", "#6b7280", "#94a3b8", "#1e293b",
   ];
 
   function openNew() {
@@ -244,17 +260,21 @@ function CategoriesTab() {
   async function handleSave() {
     setSaving(true);
     try {
+      const catData = {
+        display_name: editDisplayName,
+        name: editDisplayName.toLowerCase().replace(/\s+/g, "_"),
+        color: editColor,
+        split_type: editSplitType,
+        split_ratio: editSplitType === "equal" ? editSplitRatio : 50,
+        description: editCategory?.description ?? null,
+      };
+      const encrypted_data = await encryptCategory(catData);
+
       if (isNew) {
         const res = await fetch("/api/categories", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            display_name: editDisplayName,
-            name: editDisplayName.toLowerCase().replace(/\s+/g, "_"),
-            color: editColor,
-            split_type: editSplitType,
-            split_ratio: editSplitType === "equal" ? editSplitRatio : 50,
-          }),
+          body: JSON.stringify({ encrypted_data }),
         });
         if (res.ok) {
           toast.success("Category created");
@@ -268,10 +288,8 @@ function CategoriesTab() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             id: editCategory.id,
-            display_name: editDisplayName,
-            color: editColor,
-            split_type: editSplitType,
-            split_ratio: editSplitType === "equal" ? editSplitRatio : 50,
+            encrypted_data,
+            owner_user_id: editCategory.owner_user_id,
           }),
         });
         if (res.ok) {
@@ -593,8 +611,8 @@ function DeletedTransactionsSection({
     if (!deletedCategory) return;
     setLoading(true);
     try {
-      const data = await fetchDecrypted(`/api/transactions?category_id=${deletedCategory.id}`);
-      setDeletedTx(data as Transaction[]);
+      const allTx = await fetchDecrypted("/api/transactions") as Transaction[];
+      setDeletedTx(allTx.filter((t) => t.category_id === deletedCategory.id));
     } catch {
       // silent
     } finally {
@@ -719,17 +737,25 @@ function MerchantRulesTab() {
   const [editRule, setEditRule] = useState<MerchantRule | null>(null);
   const [editPattern, setEditPattern] = useState("");
   const [editCategoryId, setEditCategoryId] = useState<string>("");
+  const [editMatchTransactionType, setEditMatchTransactionType] = useState("");
   const [dialogOpen, setDialogOpen] = useState(false);
   const [saving, setSaving] = useState(false);
 
   const fetchData = useCallback(async () => {
     setLoading(true);
+    const dek = getDEK();
     const [rulesRes, catsRes] = await Promise.all([
       fetch("/api/merchant-rules"),
       fetch("/api/categories"),
     ]);
-    if (rulesRes.ok) setRules(await rulesRes.json());
-    if (catsRes.ok) setCategories(await catsRes.json());
+    if (rulesRes.ok) {
+      const raw = await rulesRes.json();
+      setRules(await decryptEntities(raw, dek) as unknown as MerchantRule[]);
+    }
+    if (catsRes.ok) {
+      const raw = await catsRes.json();
+      setCategories(await decryptEntities(raw, dek) as unknown as Category[]);
+    }
     setLoading(false);
   }, []);
 
@@ -741,6 +767,7 @@ function MerchantRulesTab() {
     setEditRule(rule);
     setEditPattern(rule.pattern);
     setEditCategoryId(rule.category_id || "");
+    setEditMatchTransactionType(rule.match_transaction_type || "");
     setDialogOpen(true);
   }
 
@@ -748,12 +775,24 @@ function MerchantRulesTab() {
     if (!editRule) return;
     setSaving(true);
     try {
+      const ruleData = {
+        pattern: editRule.rule_type === "auto_import" ? ".*" : editPattern,
+        rule_type: editRule.rule_type,
+        match_transaction_type: editRule.rule_type === "auto_import" ? (editMatchTransactionType || null) : null,
+        merchant_name: editRule.merchant_name,
+        merchant_type: editRule.merchant_type,
+        amount_hint: editRule.amount_hint,
+        amount_max: editRule.amount_max,
+        notes: editRule.notes,
+      };
+      const encrypted_data = await encryptMerchantRule(ruleData);
+
       const res = await fetch("/api/merchant-rules", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           id: editRule.id,
-          pattern: editPattern,
+          encrypted_data,
           category_id: editCategoryId || null,
         }),
       });
@@ -788,100 +827,177 @@ function MerchantRulesTab() {
   }
 
   const categoryMap = new Map(categories.map((c) => [c.id, c]));
+  const autoImportRules = rules.filter((r) => r.rule_type === "auto_import");
+  const patternRules = rules.filter((r) => r.rule_type === "pattern");
 
   if (loading) {
     return <p className="text-muted-foreground mt-4">Loading...</p>;
   }
 
   return (
-    <div className="space-y-4 mt-4">
-      <h2 className="text-lg font-semibold">Merchant Rules</h2>
+    <div className="space-y-6 mt-4">
+      {/* Auto-import Rules */}
+      <div className="space-y-3">
+        <div>
+          <h2 className="text-lg font-semibold">Auto-Import Rules</h2>
+          <p className="text-sm text-muted-foreground">
+            Applied automatically when transactions are imported. Match by transaction type.
+          </p>
+        </div>
 
-      {rules.length === 0 ? (
-        <Card>
-          <CardContent className="flex flex-col items-center justify-center py-12">
-            <p className="text-muted-foreground">No merchant rules yet</p>
-            <p className="text-sm text-muted-foreground">
-              Rules are created when you categorize transactions
-            </p>
-          </CardContent>
-        </Card>
-      ) : (
-        <Card>
-          <CardContent className="p-0">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Pattern</TableHead>
-                  <TableHead>Category</TableHead>
-                  <TableHead>Priority</TableHead>
-                  <TableHead>Source</TableHead>
-                  <TableHead className="w-[100px]">Actions</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {rules.map((rule) => (
-                  <TableRow key={rule.id}>
-                    <TableCell className="font-mono text-sm">
-                      {rule.pattern}
-                    </TableCell>
-                    <TableCell>
-                      {rule.category_id
-                        ? categoryMap.get(rule.category_id)?.display_name ||
-                          "Unknown"
-                        : "—"}
-                    </TableCell>
-                    <TableCell>{rule.priority}</TableCell>
-                    <TableCell>
-                      <Badge
-                        variant="outline"
-                        className="text-xs"
-                      >
-                        {rule.is_learned ? "Learned" : "Manual"}
-                      </Badge>
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex items-center gap-1">
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => openEdit(rule)}
-                        >
-                          <Pencil className="h-3.5 w-3.5" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => handleDelete(rule.id)}
-                        >
-                          <Trash2 className="h-3.5 w-3.5 text-destructive" />
-                        </Button>
-                      </div>
-                    </TableCell>
+        {autoImportRules.length === 0 ? (
+          <Card>
+            <CardContent className="flex flex-col items-center justify-center py-8">
+              <p className="text-sm text-muted-foreground">No auto-import rules</p>
+            </CardContent>
+          </Card>
+        ) : (
+          <Card>
+            <CardContent className="p-0">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>When Transaction Type Is</TableHead>
+                    <TableHead>Assign to Category</TableHead>
+                    <TableHead>Priority</TableHead>
+                    <TableHead className="w-[100px]">Actions</TableHead>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </CardContent>
-        </Card>
-      )}
+                </TableHeader>
+                <TableBody>
+                  {autoImportRules.map((rule) => (
+                    <TableRow key={rule.id}>
+                      <TableCell>
+                        <Badge variant="secondary" className="text-sm capitalize">
+                          {rule.match_transaction_type || "Any"}
+                        </Badge>
+                      </TableCell>
+                      <TableCell>
+                        {rule.category_id
+                          ? categoryMap.get(rule.category_id)?.display_name || "Unknown"
+                          : "—"}
+                      </TableCell>
+                      <TableCell>{rule.priority}</TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-1">
+                          <Button variant="ghost" size="icon" onClick={() => openEdit(rule)}>
+                            <Pencil className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button variant="ghost" size="icon" onClick={() => handleDelete(rule.id)}>
+                            <Trash2 className="h-3.5 w-3.5 text-destructive" />
+                          </Button>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+        )}
+      </div>
+
+      {/* Pattern Rules */}
+      <div className="space-y-3">
+        <div>
+          <h2 className="text-lg font-semibold">Pattern Rules</h2>
+          <p className="text-sm text-muted-foreground">
+            Match transactions by description. Run manually via &quot;Auto-sort&quot; on the transactions page, or learned when you drag-categorize.
+          </p>
+        </div>
+
+        {patternRules.length === 0 ? (
+          <Card>
+            <CardContent className="flex flex-col items-center justify-center py-8">
+              <p className="text-sm text-muted-foreground">No pattern rules yet</p>
+              <p className="text-xs text-muted-foreground">
+                Rules are created when you categorize transactions
+              </p>
+            </CardContent>
+          </Card>
+        ) : (
+          <Card>
+            <CardContent className="p-0">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Description Pattern</TableHead>
+                    <TableHead>Assign to Category</TableHead>
+                    <TableHead>Priority</TableHead>
+                    <TableHead>Source</TableHead>
+                    <TableHead className="w-[100px]">Actions</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {patternRules.map((rule) => (
+                    <TableRow key={rule.id}>
+                      <TableCell className="font-mono text-sm">
+                        {rule.pattern}
+                      </TableCell>
+                      <TableCell>
+                        {rule.category_id
+                          ? categoryMap.get(rule.category_id)?.display_name || "Unknown"
+                          : "—"}
+                      </TableCell>
+                      <TableCell>{rule.priority}</TableCell>
+                      <TableCell>
+                        <Badge variant="outline" className="text-xs">
+                          {rule.is_learned ? "Learned" : "Manual"}
+                        </Badge>
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-1">
+                          <Button variant="ghost" size="icon" onClick={() => openEdit(rule)}>
+                            <Pencil className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button variant="ghost" size="icon" onClick={() => handleDelete(rule.id)}>
+                            <Trash2 className="h-3.5 w-3.5 text-destructive" />
+                          </Button>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+        )}
+      </div>
 
       {/* Edit Rule Dialog */}
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Edit Merchant Rule</DialogTitle>
+            <DialogTitle>
+              {editRule?.rule_type === "auto_import"
+                ? "Edit Auto-Import Rule"
+                : "Edit Pattern Rule"}
+            </DialogTitle>
           </DialogHeader>
           <div className="space-y-4 py-2">
-            <div className="space-y-2">
-              <Label htmlFor="rulePattern">Pattern (regex or text)</Label>
-              <Input
-                id="rulePattern"
-                value={editPattern}
-                onChange={(e) => setEditPattern(e.target.value)}
-                className="font-mono"
-              />
-            </div>
+            {editRule?.rule_type === "auto_import" ? (
+              <div className="space-y-2">
+                <Label htmlFor="ruleTransactionType">Transaction Type</Label>
+                <Input
+                  id="ruleTransactionType"
+                  value={editMatchTransactionType}
+                  onChange={(e) => setEditMatchTransactionType(e.target.value)}
+                  placeholder="e.g. transfer, withdrawal, deposit"
+                />
+                <p className="text-xs text-muted-foreground">
+                  Transactions with this type will be automatically categorized during import
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <Label htmlFor="rulePattern">Description Pattern (regex or text)</Label>
+                <Input
+                  id="rulePattern"
+                  value={editPattern}
+                  onChange={(e) => setEditPattern(e.target.value)}
+                  className="font-mono"
+                />
+              </div>
+            )}
             <div className="space-y-2">
               <Label>Category</Label>
               <Select
@@ -889,7 +1005,11 @@ function MerchantRulesTab() {
                 onValueChange={(v) => setEditCategoryId(v || "")}
               >
                 <SelectTrigger>
-                  <SelectValue placeholder="Select category" />
+                  <SelectValue placeholder="Select category">
+                    {editCategoryId
+                      ? categoryMap.get(editCategoryId)?.display_name || "Select category"
+                      : "Select category"}
+                  </SelectValue>
                 </SelectTrigger>
                 <SelectContent>
                   {categories.map((c) => (
@@ -905,7 +1025,13 @@ function MerchantRulesTab() {
             <Button variant="outline" onClick={() => setDialogOpen(false)}>
               Cancel
             </Button>
-            <Button onClick={handleSave} disabled={saving || !editPattern}>
+            <Button
+              onClick={handleSave}
+              disabled={
+                saving ||
+                (editRule?.rule_type === "auto_import" ? !editMatchTransactionType : !editPattern)
+              }
+            >
               {saving ? "Saving..." : "Save"}
             </Button>
           </DialogFooter>

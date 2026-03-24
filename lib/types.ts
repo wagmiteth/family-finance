@@ -1,6 +1,13 @@
+// ============================================================
+// Client-side types — these represent DECRYPTED data in the browser.
+// The server only stores encrypted_data blobs + UUIDs + timestamps.
+// ============================================================
+
+// --- Core entities (decrypted view) ---
+
 export interface Household {
   id: string;
-  name: string;
+  name: string; // encrypted
   invite_code: string | null;
   created_at: string;
 }
@@ -10,21 +17,21 @@ export interface User {
   auth_id: string;
   household_id: string | null;
   email: string;
-  name: string;
-  avatar_url: string | null;
+  name: string; // encrypted
+  avatar_url: string | null; // encrypted
   created_at: string;
 }
 
 export interface Category {
   id: string;
   household_id: string;
-  name: string;
-  display_name: string;
-  description: string | null;
-  split_type: "equal" | "full_payer" | "none";
-  split_ratio: number;
+  name: string; // encrypted
+  display_name: string; // encrypted
+  description: string | null; // encrypted
+  split_type: "equal" | "full_payer" | "none"; // encrypted
+  split_ratio: number; // encrypted
   owner_user_id: string | null;
-  color: string | null;
+  color: string | null; // encrypted
   sort_order: number;
   is_system: boolean;
   created_at: string;
@@ -35,21 +42,21 @@ export interface Transaction {
   household_id: string;
   user_id: string | null;
   category_id: string | null;
-  description: string;
-  amount: number;
-  date: string;
-  transaction_type: string | null;
-  subcategory: string | null;
-  tags: string[] | null;
-  notes: string | null;
-  bank_name: string | null;
-  account_number: string | null;
-  account_name: string | null;
-  enriched_name: string | null;
-  enriched_info: string | null;
-  enriched_description: string | null;
-  enriched_address: string | null;
-  enriched_at: string | null;
+  description: string; // encrypted
+  amount: number; // encrypted
+  date: string; // encrypted
+  transaction_type: string | null; // encrypted
+  subcategory: string | null; // encrypted
+  tags: string[] | null; // encrypted
+  notes: string | null; // encrypted
+  bank_name: string | null; // encrypted
+  account_number: string | null; // encrypted
+  account_name: string | null; // encrypted
+  enriched_name: string | null; // encrypted
+  enriched_info: string | null; // encrypted
+  enriched_description: string | null; // encrypted
+  enriched_address: string | null; // encrypted
+  enriched_at: string | null; // encrypted
   import_hash: string;
   created_at: string;
   updated_at: string;
@@ -58,32 +65,35 @@ export interface Transaction {
 export interface MerchantRule {
   id: string;
   household_id: string;
-  pattern: string;
+  pattern: string; // encrypted
   category_id: string | null;
-  merchant_name: string | null;
-  merchant_type: string | null;
-  amount_hint: number | null;
-  amount_max: number | null;
+  merchant_name: string | null; // encrypted
+  merchant_type: string | null; // encrypted
+  amount_hint: number | null; // encrypted
+  amount_max: number | null; // encrypted
   priority: number;
   is_learned: boolean;
-  notes: string | null;
+  rule_type: "auto_import" | "pattern"; // encrypted
+  match_transaction_type: string | null; // encrypted
+  notes: string | null; // encrypted
   created_at: string;
 }
 
 export interface Settlement {
   id: string;
   household_id: string;
-  month: string;
-  from_user_id: string | null;
-  to_user_id: string | null;
-  amount: number;
-  shared_total: number | null;
+  settlement_hash: string;
+  month: string; // encrypted
+  from_user_id: string | null; // encrypted
+  to_user_id: string | null; // encrypted
+  amount: number; // encrypted
+  shared_total: number | null; // encrypted
   is_settled: boolean;
   settled_at: string | null;
-  settled_amount: number | null;
-  settled_from_user_id: string | null;
-  settled_to_user_id: string | null;
-  notes: string | null;
+  settled_amount: number | null; // encrypted
+  settled_from_user_id: string | null; // encrypted
+  settled_to_user_id: string | null; // encrypted
+  notes: string | null; // encrypted
   created_at: string;
 }
 
@@ -94,6 +104,70 @@ export interface UserSettings {
   theme: string;
   updated_at: string;
 }
+
+// --- Raw DB row types (what the server returns) ---
+
+export interface RawTransaction {
+  id: string;
+  household_id: string;
+  user_id: string | null;
+  category_id: string | null;
+  import_hash: string;
+  encrypted_data: string | null;
+  batch_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RawCategory {
+  id: string;
+  household_id: string;
+  owner_user_id: string | null;
+  sort_order: number;
+  is_system: boolean;
+  encrypted_data: string | null;
+  created_at: string;
+}
+
+export interface RawUser {
+  id: string;
+  auth_id: string;
+  household_id: string | null;
+  email: string;
+  encrypted_data: string | null;
+  created_at: string;
+}
+
+export interface RawHousehold {
+  id: string;
+  invite_code: string | null;
+  encrypted_dek: string | null;
+  invite_code_salt: string | null;
+  encrypted_data: string | null;
+  created_at: string;
+}
+
+export interface RawMerchantRule {
+  id: string;
+  household_id: string;
+  category_id: string | null;
+  priority: number;
+  is_learned: boolean;
+  encrypted_data: string | null;
+  created_at: string;
+}
+
+export interface RawSettlement {
+  id: string;
+  household_id: string;
+  settlement_hash: string;
+  is_settled: boolean;
+  settled_at: string | null;
+  encrypted_data: string | null;
+  created_at: string;
+}
+
+// --- Parsed transaction (from file upload, before encryption) ---
 
 export interface ParsedTransaction {
   description: string;
@@ -126,7 +200,7 @@ export interface AccountMetadata {
   bank_name: string;
   account_name: string;
   account_number?: string;
-  account_type?: string; // e.g. "Transactional", "Credit", "Savings"
+  account_type?: string;
   balance?: number;
 }
 

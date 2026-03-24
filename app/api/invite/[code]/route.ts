@@ -2,8 +2,9 @@ import { NextResponse } from "next/server";
 import { createAdminClient } from "@/lib/supabase/admin";
 
 /**
- * Public endpoint — returns non-sensitive invite info for OG previews
- * and the login page invite banner. No auth required.
+ * Public endpoint — returns invite display info for the login/onboarding UI.
+ * Uses plaintext invite_display_* fields set during household creation.
+ * These fields are only visible to someone who has the invite code.
  */
 export async function GET(
   _request: Request,
@@ -14,10 +15,9 @@ export async function GET(
     const normalized = code.trim().toUpperCase();
     const admin = createAdminClient();
 
-    // Find household by invite code
     const { data: household } = await admin
       .from("households")
-      .select("id, name, invite_code")
+      .select("id, invite_code, invite_display_name, invite_display_household, invite_display_avatar")
       .eq("invite_code", normalized)
       .is("invite_used_at", null)
       .single();
@@ -26,20 +26,10 @@ export async function GET(
       return NextResponse.json({ error: "Invite not found" }, { status: 404 });
     }
 
-    // Find the household creator (first member)
-    const { data: members } = await admin
-      .from("users")
-      .select("name, avatar_url")
-      .eq("household_id", household.id)
-      .order("created_at", { ascending: true })
-      .limit(1);
-
-    const inviter = members?.[0];
-
     return NextResponse.json({
-      household_name: household.name,
-      inviter_name: inviter?.name || "Someone",
-      inviter_avatar_url: inviter?.avatar_url || null,
+      household_name: household.invite_display_household || "A household",
+      inviter_name: household.invite_display_name || "Someone",
+      inviter_avatar_url: household.invite_display_avatar || null,
     });
   } catch {
     return NextResponse.json(

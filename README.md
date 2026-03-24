@@ -27,21 +27,25 @@ Key Encryption Key (KEK)
 Data Encryption Key (DEK) — one per household
     |
     v  AES-GCM-256 (encrypt/decrypt)
-Your transaction descriptions, bank details, notes
+ALL your data — transactions, categories, settlements, names, API keys
 ```
 
 **What the server can see:**
 
-- Transaction dates and amounts (needed for settlement calculations)
-- Category assignments (needed for expense splitting)
-- Which user made each transaction
+- Email addresses (required for authentication)
+- Opaque UUIDs and timestamps (structural metadata)
+- Import hashes (SHA-256, irreversible — used for deduplication)
 
 **What the server cannot see:**
 
-- Transaction descriptions (merchant names)
-- Bank names and account numbers
-- Notes and AI enrichment data
-- Your Anthropic API key (encrypted separately)
+- Transaction amounts, dates, descriptions, bank details, notes
+- Category names, split types, and split ratios
+- Settlement amounts and who owes whom
+- User names and household names
+- Merchant rule patterns
+- Your Anthropic API key
+
+The server is a pure encrypted storage layer — it cannot read, filter, or validate any user data. All processing (filtering, sorting, settlement calculation, auto-categorization) happens client-side in the browser after decryption.
 
 ### Key Exchange
 
@@ -68,7 +72,7 @@ All database tables use Supabase Row Level Security (RLS) policies to enforce ho
 - **Database:** Supabase (PostgreSQL with RLS)
 - **Auth:** Supabase Auth (email/password)
 - **Encryption:** Web Crypto API (AES-GCM, AES-KW, PBKDF2)
-- **AI:** Anthropic Claude API (user-provided key, encrypted at rest)
+- **AI:** Anthropic Claude API (user-provided key, client-side encrypted)
 - **Drag & Drop:** dnd-kit
 - **Charts:** Recharts
 

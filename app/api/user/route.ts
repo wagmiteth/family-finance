@@ -43,10 +43,16 @@ export async function PATCH(request: Request) {
     }
 
     const body = await request.json();
-    const updates: Record<string, string> = {};
+    const updates: Record<string, unknown> = {};
 
-    if (body.name !== undefined) updates.name = body.name;
-    if (body.avatar_url !== undefined) updates.avatar_url = body.avatar_url;
+    // Only encrypted_data can be updated (name, avatar_url are inside it)
+    if (typeof body.encrypted_data === "string") {
+      updates.encrypted_data = body.encrypted_data;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return NextResponse.json({ error: "No valid fields" }, { status: 400 });
+    }
 
     const { data: user, error } = await supabase
       .from("users")

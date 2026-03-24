@@ -4,8 +4,11 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import {
   format,
   startOfMonth,
+  endOfMonth,
   addMonths,
   subMonths,
+  parseISO,
+  isWithinInterval,
 } from "date-fns";
 import {
   DndContext,
@@ -59,6 +62,8 @@ import {
 import { toast } from "sonner";
 import type { Transaction, Category, User, MerchantRule } from "@/lib/types";
 import { useDecryptedFetch } from "@/lib/crypto/use-decrypted-fetch";
+import { decryptEntity, decryptEntities, encryptTransaction, encryptMerchantRule } from "@/lib/crypto/entity-crypto";
+import { getDEK } from "@/lib/crypto/key-store";
 
 function formatCurrency(amount: number) {
   return Math.abs(amount).toLocaleString("sv-SE", {
@@ -116,26 +121,12 @@ function TransactionCard({
         isHidden
           ? "opacity-0 h-0 p-0 m-0 border-0 overflow-hidden"
           : "cursor-grab active:cursor-grabbing hover:shadow-md shadow-sm"
-      } ${isSelected && !isHidden ? "ring-2 ring-primary border-primary" : ""}`}
+      } ${isSelected && !isHidden ? "bg-primary/5 border-primary shadow-[inset_0_0_0_1px_hsl(var(--primary))]" : ""}`}
       {...attributes}
       {...listeners}
     >
-      {/* Checkbox */}
-      <div onPointerDown={(e) => e.stopPropagation()} className="pt-1">
-        <Checkbox
-          checked={isSelected}
-          onCheckedChange={() => onToggleSelect(transaction.id, false)}
-          onClick={(e: React.MouseEvent) => {
-            if (e.shiftKey) {
-              e.preventDefault();
-              onToggleSelect(transaction.id, true);
-            }
-          }}
-        />
-      </div>
-
-      {/* Payer avatar */}
-      <div onPointerDown={(e) => e.stopPropagation()} className="pt-0.5">
+      {/* Payer avatar + Checkbox stacked */}
+      <div onPointerDown={(e) => e.stopPropagation()} className="flex flex-col items-center gap-1.5 pt-1">
         <Popover>
           <PopoverTrigger
             render={
@@ -144,9 +135,9 @@ function TransactionCard({
                 title={`Payer: ${user?.name || "?"}`}
                 className={`rounded-full ring-2 ring-offset-1 transition-colors hover:ring-offset-2 ${userIndex === 0 ? "ring-primary" : "ring-warm"}`}
               >
-                <Avatar className="h-7 w-7">
+                <Avatar className="h-4 w-4">
                   {user?.avatar_url && <AvatarImage src={user.avatar_url} />}
-                  <AvatarFallback className="text-[10px] font-semibold">
+                  <AvatarFallback className="text-[7px] font-semibold">
                     {user?.name?.[0]?.toUpperCase() || "?"}
                   </AvatarFallback>
                 </Avatar>
@@ -175,6 +166,16 @@ function TransactionCard({
             ))}
           </PopoverContent>
         </Popover>
+        <Checkbox
+          checked={isSelected}
+          onCheckedChange={() => onToggleSelect(transaction.id, false)}
+          onClick={(e: React.MouseEvent) => {
+            if (e.shiftKey) {
+              e.preventDefault();
+              onToggleSelect(transaction.id, true);
+            }
+          }}
+        />
       </div>
 
       {/* Content */}
@@ -198,6 +199,11 @@ function TransactionCard({
             <span className="text-xs text-muted-foreground">
               {format(new Date(transaction.date), "MMM d")}
             </span>
+            {transaction.bank_name && (
+              <span className="text-[10px] text-muted-foreground/70">
+                · {transaction.bank_name}
+              </span>
+            )}
             {transaction.enriched_at && (
               <Sparkles className="h-3 w-3 text-amber-500" />
             )}
@@ -490,7 +496,6 @@ function TransactionDetailDialog({
   onUpdate: (t: Transaction) => void;
   onDelete: (t: Transaction) => void;
 }) {
-  const [editingNotes, setEditingNotes] = useState(false);
   const [notes, setNotes] = useState("");
   const [savingNotes, setSavingNotes] = useState(false);
   const [selectedCategoryId, setSelectedCategoryId] = useState<string>("");
@@ -499,7 +504,6 @@ function TransactionDetailDialog({
     if (transaction) {
       setNotes(transaction.notes || "");
       setSelectedCategoryId(transaction.category_id || "");
-      setEditingNotes(false);
     }
   }, [transaction]);
 
@@ -509,23 +513,31 @@ function TransactionDetailDialog({
   const userIndex = users.findIndex((u) => u.id === transaction.user_id);
   const userColor = userIndex === 0 ? "border-primary text-primary" : "border-warm text-warm";
 
+  const notesChanged = notes.trim() !== (transaction?.notes || "").trim();
+
   async function handleSaveNotes() {
-    if (!transaction) return;
+    if (!transaction || savingNotes) return;
+    const trimmed = notes.trim();
+    const original = (transaction.notes || "").trim();
+    if (trimmed === original) return;
     setSavingNotes(true);
     try {
+      // Notes is an encrypted field — re-encrypt the full transaction with updated notes
+      const updated = { ...transaction, notes: trimmed || null };
+      const encrypted_data = await encryptTransaction(updated as unknown as Record<string, unknown>);
       const res = await fetch(`/api/transactions/${transaction.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ notes }),
+        body: JSON.stringify({ encrypted_data }),
       });
       if (res.ok) {
-        const updated = await res.json();
         onUpdate(updated);
-        setEditingNotes(false);
-        toast.success("Notes saved");
+        toast.success("Note saved");
+      } else {
+        toast.error("Failed to save note");
       }
     } catch {
-      toast.error("Failed to save notes");
+      toast.error("Failed to save note");
     } finally {
       setSavingNotes(false);
     }
@@ -541,8 +553,8 @@ function TransactionDetailDialog({
         body: JSON.stringify({ category_id: catId || null }),
       });
       if (res.ok) {
-        const updated = await res.json();
-        onUpdate(updated);
+        const serverData = await res.json();
+        onUpdate({ ...transaction, ...serverData });
         toast.success("Category updated");
       }
     } catch {
@@ -680,51 +692,35 @@ function TransactionDetailDialog({
           {/* Notes */}
           <Separator />
           <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-                Notes
-              </p>
-              {!editingNotes && (
+            <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+              Notes
+            </p>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    handleSaveNotes();
+                  }
+                }}
+                className="flex-1 rounded-md border border-input bg-background px-3 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                placeholder="Add a note..."
+                disabled={savingNotes}
+              />
+              {notesChanged && (
                 <Button
-                  variant="ghost"
                   size="sm"
-                  className="text-xs h-6"
-                  onClick={() => setEditingNotes(true)}
+                  onClick={handleSaveNotes}
+                  disabled={savingNotes}
+                  className="shrink-0"
                 >
-                  {transaction.notes ? "Edit" : "Add note"}
+                  {savingNotes ? "Saving..." : "Save"}
                 </Button>
               )}
             </div>
-            {editingNotes ? (
-              <div className="space-y-2">
-                <textarea
-                  value={notes}
-                  onChange={(e) => setNotes(e.target.value)}
-                  rows={3}
-                  className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm resize-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                  placeholder="Add a note..."
-                />
-                <div className="flex gap-2">
-                  <Button size="sm" onClick={handleSaveNotes} disabled={savingNotes}>
-                    {savingNotes ? "Saving..." : "Save"}
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => {
-                      setEditingNotes(false);
-                      setNotes(transaction.notes || "");
-                    }}
-                  >
-                    Cancel
-                  </Button>
-                </div>
-              </div>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                {transaction.notes || "No notes"}
-              </p>
-            )}
           </div>
 
           {/* Metadata */}
@@ -791,17 +787,9 @@ function getSmartColumnOrder(
   categories: Category[],
   currentUserId: string | null
 ): Category[] {
-  // Check if user has customized sort_order (all defaults are 0-6 sequential)
-  const hasCustomOrder = categories.some(
-    (c, i) => c.sort_order !== i
-  );
-
-  if (hasCustomOrder) {
-    return [...categories].sort((a, b) => a.sort_order - b.sort_order);
-  }
-
-  // Apply smart default ordering:
-  // Uncategorized, Shared, Exclude, current user's categories, other user's categories
+  // Always apply smart default ordering per viewer:
+  // Uncategorized, other user's cats, Shared, current user's cats, Exclude
+  // This way you review the other person's spending first, then shared, then your own.
   const uncategorized = categories.filter((c) => c.name === "uncategorized");
   const shared = categories.filter((c) => c.name === "shared");
   const exclude = categories.filter((c) => c.name === "exclude");
@@ -830,10 +818,10 @@ function getSmartColumnOrder(
 
   return [
     ...uncategorized,
-    ...shared,
-    ...exclude,
-    ...currentUserCats.sort((a, b) => a.sort_order - b.sort_order),
     ...otherUserCats.sort((a, b) => a.sort_order - b.sort_order),
+    ...shared,
+    ...currentUserCats.sort((a, b) => a.sort_order - b.sort_order),
+    ...exclude,
     ...otherCats.sort((a, b) => a.sort_order - b.sort_order),
   ];
 }
@@ -845,7 +833,9 @@ function autoCategorizeTransaction(
   amount: number,
   rules: MerchantRule[]
 ): string | null {
-  const sortedRules = [...rules].sort((a, b) => b.priority - a.priority);
+  // Only use pattern rules for manual auto-sort (not auto_import rules)
+  const patternRules = rules.filter((r) => r.rule_type === "pattern");
+  const sortedRules = [...patternRules].sort((a, b) => b.priority - a.priority);
 
   for (const rule of sortedRules) {
     try {
@@ -875,7 +865,7 @@ function autoCategorizeTransaction(
 // ─── Main Page ───────────────────────────────────────────────────────────────
 
 export default function TransactionsPage() {
-  const [currentMonth, setCurrentMonth] = useState(startOfMonth(new Date()));
+  const [currentMonth, setCurrentMonth] = useState<Date | null>(null);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [users, setUsers] = useState<User[]>([]);
@@ -901,30 +891,71 @@ export default function TransactionsPage() {
 
   const fetchData = useCallback(async () => {
     setLoading(true);
-    const month = format(currentMonth, "yyyy-MM");
 
     try {
       const [txData, catRes, usersRes, userRes, rulesRes] = await Promise.all([
-        fetchDecrypted(`/api/transactions?month=${month}`),
+        fetchDecrypted("/api/transactions"),
         fetch("/api/categories"),
         fetch("/api/users"),
         fetch("/api/user"),
         fetch("/api/merchant-rules"),
       ]);
 
-      if (catRes.ok) {
-        const cats = await catRes.json();
-        setCategories(cats);
-        // Filter out transactions in the "Deleted" category
-        const deletedCatId = cats.find((c: Category) => c.name === "deleted")?.id;
-        const allTx = txData as Transaction[];
-        setTransactions(deletedCatId ? allTx.filter((t) => t.category_id !== deletedCatId) : allTx);
-      } else {
-        setTransactions(txData as Transaction[]);
+      const dek = getDEK();
+      const allTx = txData as Transaction[];
+
+      // On first load (no month selected yet), auto-detect from the most recent transaction date
+      let activeMonth = currentMonth;
+      if (!activeMonth && allTx.length > 0) {
+        let latest: Date | null = null;
+        for (const t of allTx) {
+          if (!t.date) continue;
+          try {
+            const d = parseISO(t.date);
+            if (!latest || d > latest) latest = d;
+          } catch { /* skip */ }
+        }
+        activeMonth = startOfMonth(latest ?? new Date());
+        setCurrentMonth(activeMonth);
       }
-      if (usersRes.ok) setUsers(await usersRes.json());
-      if (userRes.ok) setCurrentUser(await userRes.json());
-      if (rulesRes.ok) setMerchantRules(await rulesRes.json());
+      if (!activeMonth) {
+        activeMonth = startOfMonth(new Date());
+        setCurrentMonth(activeMonth);
+      }
+
+      const monthStart = startOfMonth(activeMonth);
+      const monthEnd = endOfMonth(activeMonth);
+      const filterByMonth = (t: Transaction) => {
+        if (!t.date) return false;
+        try {
+          return isWithinInterval(parseISO(t.date), { start: monthStart, end: monthEnd });
+        } catch {
+          return false;
+        }
+      };
+
+      if (catRes.ok) {
+        const rawCats = await catRes.json();
+        const cats = await decryptEntities(rawCats, dek) as unknown as Category[];
+        setCategories(cats);
+        const deletedCatId = cats.find((c: Category) => c.name === "deleted")?.id;
+        const monthFiltered = allTx.filter(filterByMonth);
+        setTransactions(deletedCatId ? monthFiltered.filter((t) => t.category_id !== deletedCatId) : monthFiltered);
+      } else {
+        setTransactions(allTx.filter(filterByMonth));
+      }
+      if (usersRes.ok) {
+        const rawUsers = await usersRes.json();
+        setUsers(await decryptEntities(rawUsers, dek) as unknown as User[]);
+      }
+      if (userRes.ok) {
+        const rawUser = await userRes.json();
+        setCurrentUser(await decryptEntity(rawUser, dek) as unknown as User);
+      }
+      if (rulesRes.ok) {
+        const rawRules = await rulesRes.json();
+        setMerchantRules(await decryptEntities(rawRules, dek) as unknown as MerchantRule[]);
+      }
     } catch {
       // silent
     } finally {
@@ -937,9 +968,25 @@ export default function TransactionsPage() {
   }, [fetchData]);
 
   // Compute smart column order when categories or current user changes
+  // Per-user column order is stored in localStorage
   useEffect(() => {
-    if (categories.length > 0) {
-      const ordered = getSmartColumnOrder(categories, currentUser?.id || null);
+    if (categories.length > 0 && currentUser?.id) {
+      const storageKey = `tx-col-order:${currentUser.id}`;
+      const saved = localStorage.getItem(storageKey);
+      if (saved) {
+        try {
+          const savedOrder = JSON.parse(saved) as string[];
+          // Validate saved IDs still exist, append any new categories
+          const catIds = new Set(categories.filter((c) => c.name !== "deleted").map((c) => c.id));
+          const valid = savedOrder.filter((id) => catIds.has(id));
+          const missing = [...catIds].filter((id) => !valid.includes(id));
+          if (valid.length > 0) {
+            setColumnOrder([...valid, ...missing]);
+            return;
+          }
+        } catch { /* fall through to smart default */ }
+      }
+      const ordered = getSmartColumnOrder(categories, currentUser.id);
       setColumnOrder(ordered.map((c) => c.id));
     }
   }, [categories, currentUser?.id]);
@@ -1074,17 +1121,9 @@ export default function TransactionsPage() {
       const newOrder = arrayMove(columnOrder, oldIndex, newIndex);
       setColumnOrder(newOrder);
 
-      // Persist the new order
-      const orderPayload = newOrder.map((id, i) => ({ id, sort_order: i }));
-      try {
-        await fetch("/api/categories", {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ order: orderPayload }),
-        });
-      } catch {
-        // Revert on failure
-        setColumnOrder(columnOrder);
+      // Persist per-user column order in localStorage
+      if (currentUser?.id) {
+        localStorage.setItem(`tx-col-order:${currentUser.id}`, JSON.stringify(newOrder));
       }
 
       return;
@@ -1148,63 +1187,82 @@ export default function TransactionsPage() {
 
       toast.success(`Moved ${idsToMove.length} transaction(s)`);
 
-      // Auto-create/update merchant rules
-      if (resolvedTargetId) {
+      // Auto-create/update merchant rules (skip for Exclude/Deleted/Uncategorized)
+      const targetCat = categories.find((c) => c.id === resolvedTargetId);
+      const skipAutoLearn = !resolvedTargetId || targetCat?.split_type === "none";
+
+      if (!skipAutoLearn) {
         const movedTxs = transactions.filter((t) => idsToMove.includes(t.id));
         const uniqueDescriptions = [
-          ...new Set(movedTxs.map((t) => t.description.toLowerCase().trim())),
+          ...new Set(movedTxs.map((t) => t.description.toLowerCase().trim()).filter(Boolean)),
         ];
 
-        const ruleResults = await Promise.all(
-          uniqueDescriptions.map(async (desc) => {
-            // Check if rule already exists for this pattern
-            const existingRule = merchantRules.find(
-              (r) => r.pattern.toLowerCase() === desc
-            );
+        // Batch: separate new vs existing rules
+        const toCreate: string[] = [];
+        const toUpdate: { id: string; desc: string }[] = [];
 
-            try {
-              if (existingRule) {
-                // Update existing rule to new category
-                const ruleRes = await fetch("/api/merchant-rules", {
-                  method: "PATCH",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    id: existingRule.id,
-                    category_id: resolvedTargetId,
-                  }),
-                });
-                return ruleRes.ok ? "updated" : false;
-              } else {
-                // Create new rule
-                const ruleRes = await fetch("/api/merchant-rules", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    pattern: desc,
-                    category_id: resolvedTargetId,
-                    is_learned: true,
-                  }),
-                });
-                return ruleRes.ok ? "created" : false;
-              }
-            } catch {
-              return false;
+        for (const desc of uniqueDescriptions) {
+          const existing = merchantRules.find(
+            (r) => r.pattern.toLowerCase() === desc
+          );
+          if (existing) {
+            if (existing.category_id !== resolvedTargetId) {
+              toUpdate.push({ id: existing.id, desc });
             }
-          })
-        );
+          } else {
+            toCreate.push(desc);
+          }
+        }
 
-        const created = ruleResults.filter((r) => r === "created").length;
-        const updated = ruleResults.filter((r) => r === "updated").length;
+        // Fire updates/creates in parallel but don't block the UI
+        const rulePromises: Promise<unknown>[] = [];
 
-        if (created > 0 || updated > 0) {
-          const parts = [];
-          if (created > 0) parts.push(`Created ${created} rule${created > 1 ? "s" : ""}`);
-          if (updated > 0) parts.push(`Updated ${updated} rule${updated > 1 ? "s" : ""}`);
-          toast.success(parts.join(", "));
+        for (const item of toUpdate) {
+          rulePromises.push(
+            fetch("/api/merchant-rules", {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ id: item.id, category_id: resolvedTargetId }),
+            })
+          );
+        }
 
-          // Refresh rules
+        // Batch-encrypt new rules
+        for (const desc of toCreate) {
+          rulePromises.push(
+            (async () => {
+              const encrypted_data = await encryptMerchantRule({
+                pattern: desc,
+                rule_type: "pattern",
+                match_transaction_type: null,
+                merchant_name: null,
+                merchant_type: null,
+                amount_hint: null,
+                amount_max: null,
+                notes: null,
+              });
+              return fetch("/api/merchant-rules", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  encrypted_data,
+                  category_id: resolvedTargetId,
+                  is_learned: true,
+                }),
+              });
+            })()
+          );
+        }
+
+        if (rulePromises.length > 0) {
+          await Promise.all(rulePromises);
+          // Refresh rules with decryption
+          const dek = getDEK();
           const rulesRes = await fetch("/api/merchant-rules");
-          if (rulesRes.ok) setMerchantRules(await rulesRes.json());
+          if (rulesRes.ok) {
+            const raw = await rulesRes.json();
+            setMerchantRules(await decryptEntities(raw, dek) as unknown as MerchantRule[]);
+          }
         }
       }
     } catch {
@@ -1429,17 +1487,17 @@ export default function TransactionsPage() {
           <Button
             variant="outline"
             size="icon"
-            onClick={() => setCurrentMonth(subMonths(currentMonth, 1))}
+            onClick={() => setCurrentMonth(subMonths(currentMonth || new Date(), 1))}
           >
             <ChevronLeft className="h-4 w-4" />
           </Button>
           <span className="min-w-[140px] text-center font-medium">
-            {format(currentMonth, "MMMM yyyy")}
+            {currentMonth ? format(currentMonth, "MMMM yyyy") : "Loading\u2026"}
           </span>
           <Button
             variant="outline"
             size="icon"
-            onClick={() => setCurrentMonth(addMonths(currentMonth, 1))}
+            onClick={() => setCurrentMonth(addMonths(currentMonth || new Date(), 1))}
           >
             <ChevronRight className="h-4 w-4" />
           </Button>

@@ -1,12 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 
-function maskApiKey(key: string | null): string | null {
-  if (!key) return null;
-  if (key.length <= 12) return "••••••••";
-  return key.slice(0, 7) + "••••" + key.slice(-4);
-}
-
 export async function GET() {
   try {
     const supabase = await createClient();
@@ -28,7 +22,6 @@ export async function GET() {
       return NextResponse.json({ error: "User not found" }, { status: 404 });
     }
 
-    // Fetch settings and decrypt the API key server-side
     const { data: settings, error } = await supabase
       .from("user_settings")
       .select("user_id, theme, updated_at, encrypted_api_key")
@@ -42,26 +35,13 @@ export async function GET() {
       );
     }
 
-    // Decrypt the key to check if it exists, but only return a masked version
-    let hasApiKey = false;
-    let maskedApiKey: string | null = null;
-
-    if (settings.encrypted_api_key) {
-      const { data: decrypted } = await supabase.rpc("decrypt_api_key", {
-        ciphertext: settings.encrypted_api_key,
-      });
-      if (decrypted) {
-        hasApiKey = true;
-        maskedApiKey = maskApiKey(decrypted);
-      }
-    }
-
+    // Return the encrypted blob — client decrypts to check/display
     return NextResponse.json({
       user_id: settings.user_id,
       theme: settings.theme,
       updated_at: settings.updated_at,
-      has_api_key: hasApiKey,
-      masked_api_key: maskedApiKey,
+      has_api_key: !!settings.encrypted_api_key,
+      encrypted_api_key: settings.encrypted_api_key,
     });
   } catch {
     return NextResponse.json(
@@ -99,32 +79,16 @@ export async function PATCH(request: Request) {
 
     if (body.theme !== undefined) updates.theme = body.theme;
 
-    // Handle API key: encrypt before storing
-    if (body.anthropic_api_key !== undefined) {
-      if (body.anthropic_api_key === null || body.anthropic_api_key === "") {
-        // Clear the key
-        updates.encrypted_api_key = null;
-      } else {
-        // Encrypt the new key using the database function
-        const { data: encrypted, error: encryptError } = await supabase.rpc(
-          "encrypt_api_key",
-          { plaintext: body.anthropic_api_key }
-        );
-        if (encryptError) {
-          return NextResponse.json(
-            { error: "Failed to encrypt API key" },
-            { status: 500 }
-          );
-        }
-        updates.encrypted_api_key = encrypted;
-      }
+    // API key is now client-encrypted — stored as encrypted blob
+    if ("encrypted_api_key" in body) {
+      updates.encrypted_api_key = body.encrypted_api_key ?? null;
     }
 
     const { data: settings, error } = await supabase
       .from("user_settings")
       .update(updates)
       .eq("user_id", appUser.id)
-      .select("user_id, theme, updated_at")
+      .select("user_id, theme, updated_at, encrypted_api_key")
       .single();
 
     if (error) {
@@ -136,7 +100,7 @@ export async function PATCH(request: Request) {
 
     return NextResponse.json({
       ...settings,
-      has_api_key: body.anthropic_api_key !== null && body.anthropic_api_key !== "",
+      has_api_key: !!settings.encrypted_api_key,
     });
   } catch {
     return NextResponse.json(

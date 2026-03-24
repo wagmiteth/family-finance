@@ -63,22 +63,8 @@ export async function POST(request: Request) {
     } = admin.storage.from("avatars").getPublicUrl(filePath);
     const publicUrl = `${basePublicUrl}?v=${Date.now()}`;
 
-    // Update user avatar_url
-    const { data: user, error: updateError } = await admin
-      .from("users")
-      .update({ avatar_url: publicUrl })
-      .eq("auth_id", authUser.id)
-      .select()
-      .single();
-
-    if (updateError) {
-      return NextResponse.json(
-        { error: "Failed to update user" },
-        { status: 500 }
-      );
-    }
-
-    return NextResponse.json({ avatar_url: publicUrl, user });
+    // Return the URL — client will encrypt it into user's encrypted_data
+    return NextResponse.json({ avatar_url: publicUrl });
   } catch {
     return NextResponse.json(
       { error: "Internal server error" },

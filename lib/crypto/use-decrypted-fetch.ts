@@ -3,70 +3,13 @@
 import { useCallback } from "react";
 import { useEncryption } from "./encryption-context";
 import { getDEK } from "./key-store";
-import { decryptData, fromBase64 } from "./client-crypto";
-
-interface RawTransaction {
-  encryption_version?: number;
-  encrypted_data?: string | null;
-  [key: string]: unknown;
-}
-
-const SENSITIVE_FIELDS = [
-  "description",
-  "bank_name",
-  "account_number",
-  "account_name",
-  "notes",
-  "enriched_name",
-  "enriched_info",
-  "enriched_description",
-  "enriched_address",
-];
+import { decryptEntity, encryptFields, TRANSACTION_ENCRYPTED_FIELDS } from "./entity-crypto";
 
 /**
- * Decrypt a single transaction's encrypted_data if it's v1.
- * V0 transactions arrive already decrypted from the server.
- */
-async function decryptTransaction(
-  t: RawTransaction,
-  dek: CryptoKey | null
-): Promise<RawTransaction> {
-  const version = t.encryption_version ?? 0;
-
-  // V0: already decrypted by server
-  if (version === 0 || !t.encrypted_data) return t;
-
-  // V1: client-side decryption
-  if (!dek) {
-    return { ...t, description: "[Encrypted]" };
-  }
-
-  try {
-    const blob = fromBase64(t.encrypted_data as string);
-    const json = await decryptData(blob, dek);
-    const sensitive = JSON.parse(json);
-
-    const merged = { ...t };
-    for (const key of SENSITIVE_FIELDS) {
-      merged[key] = sensitive[key] ?? null;
-    }
-    return merged;
-  } catch (err) {
-    console.error("[decryptTransaction] Failed for tx:", t.id ?? "unknown", {
-      encryption_version: t.encryption_version,
-      has_encrypted_data: !!t.encrypted_data,
-      encrypted_data_length: typeof t.encrypted_data === "string" ? t.encrypted_data.length : 0,
-      has_dek: !!dek,
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return { ...t, description: "[Decryption failed]" };
-  }
-}
-
-/**
- * Hook that returns a function to fetch transactions and decrypt v1 ones.
- * Usage: const fetchDecrypted = useDecryptedFetch();
- *        const transactions = await fetchDecrypted("/api/transactions?month=2026-03");
+ * Hook that returns a function to fetch and decrypt any entity type.
+ * Usage:
+ *   const fetchDecrypted = useDecryptedFetch();
+ *   const transactions = await fetchDecrypted("/api/transactions");
  */
 export function useDecryptedFetch() {
   const { isUnlocked } = useEncryption();
@@ -77,20 +20,11 @@ export function useDecryptedFetch() {
       if (!res.ok) return [];
 
       const data = await res.json();
-      const transactions: RawTransaction[] = Array.isArray(data) ? data : [];
+      const rows: Record<string, unknown>[] = Array.isArray(data) ? data : [];
 
       const dek = getDEK();
-      if (transactions.length > 0) {
-        const v1Count = transactions.filter((t) => t.encryption_version === 1).length;
-        console.log("[useDecryptedFetch]", {
-          total: transactions.length,
-          v1_encrypted: v1Count,
-          dek_available: !!dek,
-          isUnlocked,
-        });
-      }
       return Promise.all(
-        transactions.map((t) => decryptTransaction(t, dek))
+        rows.map((row) => decryptEntity(row, dek))
       );
     },
     [isUnlocked]
@@ -98,32 +32,34 @@ export function useDecryptedFetch() {
 }
 
 /**
- * Encrypt sensitive fields for a single transaction before sending to the API.
- * Returns the transaction with `encrypted_data` set and sensitive fields removed.
+ * Encrypt a transaction's sensitive fields for the API.
+ * Returns { encrypted_data, ...plaintext_fields } ready to POST/PATCH.
  */
-export async function encryptForApi(
+export async function encryptTransactionForApi(
   transaction: Record<string, unknown>
 ): Promise<Record<string, unknown>> {
-  const { encryptData, toBase64 } = await import("./client-crypto");
   const dek = getDEK();
   if (!dek) throw new Error("Encryption not unlocked");
 
-  const sensitive: Record<string, unknown> = {};
-  for (const key of SENSITIVE_FIELDS) {
-    sensitive[key] = transaction[key] ?? null;
-  }
+  const encrypted_data = await encryptFields(
+    transaction,
+    TRANSACTION_ENCRYPTED_FIELDS,
+    dek
+  );
 
-  const json = JSON.stringify(sensitive);
-  const blob = await encryptData(json, dek);
+  // Build payload with only server-stored plaintext fields + encrypted blob
+  const payload: Record<string, unknown> = {
+    user_id: transaction.user_id,
+    category_id: transaction.category_id,
+    import_hash: transaction.import_hash,
+    encrypted_data,
+  };
 
-  // Build the API payload with encrypted_data and without plaintext sensitive fields
-  const payload: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(transaction)) {
-    if (!SENSITIVE_FIELDS.includes(key)) {
-      payload[key] = value;
-    }
-  }
-  payload.encrypted_data = toBase64(blob);
+  // Optional fields
+  if (transaction.batch_id) payload.batch_id = transaction.batch_id;
 
   return payload;
 }
+
+// Re-export for backward compatibility
+export { encryptFields as encryptForApi } from "./entity-crypto";
