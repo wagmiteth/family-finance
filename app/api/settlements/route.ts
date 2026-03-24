@@ -80,15 +80,22 @@ export async function POST(request: Request) {
     }
 
     // Upsert by settlement_hash (client-computed SHA-256 of household_id + month)
+    const settlementPayload: Record<string, unknown> = {
+      household_id: appUser.household_id,
+      settlement_hash: body.settlement_hash,
+      encrypted_data: body.encrypted_data,
+      is_settled: body.is_settled ?? false,
+    };
+
+    if ("settled_at" in body) {
+      settlementPayload.settled_at =
+        typeof body.settled_at === "string" ? body.settled_at : null;
+    }
+
     const { data: settlement, error } = await supabase
       .from("settlements")
       .upsert(
-        {
-          household_id: appUser.household_id,
-          settlement_hash: body.settlement_hash,
-          encrypted_data: body.encrypted_data,
-          is_settled: body.is_settled ?? false,
-        },
+        settlementPayload,
         { onConflict: "household_id,settlement_hash" }
       )
       .select()

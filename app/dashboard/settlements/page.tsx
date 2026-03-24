@@ -1,30 +1,57 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
-import { format } from "date-fns";
+import { useEffect, useRef, useState } from "react";
+import { endOfMonth, format, isWithinInterval, parseISO, startOfMonth } from "date-fns";
 import {
-  Card,
-  CardContent,
-} from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Separator } from "@/components/ui/separator";
-import {
-  Calculator,
+  AlertTriangle,
+  ArrowRight,
   Check,
-  Clock,
   ChevronDown,
   ChevronUp,
-  ArrowRight,
+  Clock,
   Loader2,
-  AlertTriangle,
-  RefreshCw,
+  RotateCcw,
 } from "lucide-react";
 import { toast } from "sonner";
-import type { Settlement, User, Transaction, Category } from "@/lib/types";
-import { useDecryptedFetch } from "@/lib/crypto/use-decrypted-fetch";
-import { decryptEntities } from "@/lib/crypto/entity-crypto";
-import { getDEK } from "@/lib/crypto/key-store";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Separator } from "@/components/ui/separator";
+import { TransactionDetailDialog } from "@/components/transaction-detail-dialog";
+import { useData } from "@/lib/crypto/data-provider";
+import { encryptSettlement } from "@/lib/crypto/entity-crypto";
+import {
+  buildSettlementBreakdown,
+  type SettlementBreakdown,
+  type SettlementTransfer,
+  generateSettlementHash,
+  getSettlementParticipants,
+} from "@/lib/settlements/calculator";
+import type {
+  Category,
+  Settlement,
+  SettlementBatch,
+  SettlementTransactionSnapshot,
+  Transaction,
+  User,
+} from "@/lib/types";
+import { cn } from "@/lib/utils";
+
+interface MonthlySettlementView {
+  month: string;
+  record: Settlement | null;
+  monthTransactions: Transaction[];
+  monthTotal: SettlementBreakdown;
+  pending: SettlementBreakdown;
+  settledBatches: SettlementBatch[];
+  uncategorizedCount: number;
+  uncategorizedAmount: number;
+}
+
+interface SettlementDetailState {
+  transaction: Transaction;
+  isFrozen: boolean;
+}
 
 function formatCurrency(amount: number) {
   return Math.abs(amount).toLocaleString("sv-SE", {
@@ -35,374 +62,1027 @@ function formatCurrency(amount: number) {
   });
 }
 
-// Compute the adjustment needed for a settled month that has changed
-function getAdjustment(settlement: Settlement, users: User[]) {
-  if (
-    !settlement.is_settled ||
-    settlement.settled_amount === null ||
-    settlement.settled_amount === undefined
-  ) {
+function formatSignedCurrency(amount: number) {
+  if (Math.abs(amount) < 0.01) {
+    return formatCurrency(0);
+  }
+
+  const prefix = amount > 0 ? "+" : "-";
+  return `${prefix}${formatCurrency(amount)}`;
+}
+
+function formatSharePercent(share: number, total: number) {
+  if (total < 0.01) {
+    return "0%";
+  }
+
+  const percent = (share / total) * 100;
+  const rounded = Math.round(percent * 10) / 10;
+  return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1)}%`;
+}
+
+function getAmountTone(amount: number) {
+  return amount >= 0
+    ? "text-emerald-700 dark:text-emerald-300"
+    : "text-muted-foreground";
+}
+
+function formatSettlementMetric(amount: number) {
+  if (Math.abs(amount) < 0.01) {
+    return formatCurrency(0);
+  }
+
+  return amount < 0 ? formatSignedCurrency(amount) : formatCurrency(amount);
+}
+
+function monthDate(month: string) {
+  return parseISO(`${month}-01`);
+}
+
+function monthKey(value: string | null | undefined) {
+  if (!value) return null;
+  return value.slice(0, 7);
+}
+
+function formatTimestamp(value: string | null | undefined) {
+  if (!value) return "unknown time";
+
+  try {
+    return format(parseISO(value), "MMM d, yyyy HH:mm");
+  } catch {
+    return value;
+  }
+}
+
+function formatTransactionDate(value: string) {
+  try {
+    return format(parseISO(value), "MMM d");
+  } catch {
+    return value;
+  }
+}
+
+function compareIso(left: string, right: string) {
+  const leftTime = Date.parse(left);
+  const rightTime = Date.parse(right);
+
+  if (Number.isNaN(leftTime) || Number.isNaN(rightTime)) {
+    return left.localeCompare(right);
+  }
+
+  return leftTime - rightTime;
+}
+
+function sortTransactionsNewestFirst(
+  transactions: SettlementTransactionSnapshot[]
+) {
+  return [...transactions].sort((left, right) => {
+    const byDate = compareIso(right.date, left.date);
+    if (byDate !== 0) {
+      return byDate;
+    }
+
+    return compareIso(right.created_at, left.created_at);
+  });
+}
+
+function isTransactionInMonth(
+  transaction: { date: string },
+  month: string
+) {
+  try {
+    const date = parseISO(transaction.date);
+    const monthStart = startOfMonth(monthDate(month));
+    const monthEnd = endOfMonth(monthDate(month));
+    return isWithinInterval(date, { start: monthStart, end: monthEnd });
+  } catch {
+    return false;
+  }
+}
+
+function buildStoredBatchBreakdown(
+  batch: SettlementBatch,
+  categories: Category[],
+  users: User[]
+) {
+  if (batch.users?.length && batch.categories?.length && batch.transactions?.length) {
+    const relevantTotal = batch.categories.reduce(
+      (sum, category) => sum + category.total,
+      0
+    );
+
+    return {
+      sharedTotal: batch.shared_total || 0,
+      crossPaidTotal: Math.max(0, relevantTotal - (batch.shared_total || 0)),
+      relevantTotal,
+      transactionCount: batch.transactions.length,
+      users: batch.users,
+      categories: batch.categories,
+      transfer: {
+        fromUserId: batch.from_user_id,
+        toUserId: batch.to_user_id,
+        amount: batch.amount,
+      },
+      transactions: sortTransactionsNewestFirst(batch.transactions),
+    };
+  }
+
+  return buildSettlementBreakdown(batch.transactions || [], categories, users);
+}
+
+function buildLegacyBatch(
+  settlement: Settlement,
+  currentRelevantTransactions: SettlementTransactionSnapshot[],
+  categories: Category[],
+  users: User[]
+) {
+  if (!settlement.is_settled) {
     return null;
   }
 
-  const currentAmount = settlement.amount;
-  const settledAmount = settlement.settled_amount;
-  const currentFrom = settlement.from_user_id;
-  const currentTo = settlement.to_user_id;
-  const settledFrom = settlement.settled_from_user_id;
-  const settledTo = settlement.settled_to_user_id;
-
-  // Same direction — just a difference in amount
-  if (currentFrom === settledFrom && currentTo === settledTo) {
-    const diff = currentAmount - settledAmount;
-    if (Math.abs(diff) < 1) return null; // no meaningful change
-
-    const fromUser = users.find((u) => u.id === currentFrom);
-    const toUser = users.find((u) => u.id === currentTo);
-
-    if (diff > 0) {
-      // More owed now — from needs to pay more
-      return {
-        type: "additional" as const,
-        fromUser,
-        toUser,
-        amount: diff,
-        description: `${fromUser?.name} needs to pay ${formatCurrency(diff)} more to ${toUser?.name}`,
-      };
-    } else {
-      // Less owed now — to needs to refund
-      return {
-        type: "refund" as const,
-        fromUser: toUser,
-        toUser: fromUser,
-        amount: Math.abs(diff),
-        description: `${toUser?.name} needs to refund ${formatCurrency(Math.abs(diff))} to ${fromUser?.name}`,
-      };
-    }
+  if (
+    settlement.settled_at &&
+    settlement.settled_users &&
+    settlement.settled_categories &&
+    settlement.settled_transactions
+  ) {
+    return {
+      id: `legacy-${settlement.id}`,
+      settled_at: settlement.settled_at,
+      amount: settlement.settled_amount || 0,
+      shared_total: settlement.shared_total || 0,
+      from_user_id: settlement.settled_from_user_id,
+      to_user_id: settlement.settled_to_user_id,
+      users: settlement.settled_users,
+      categories: settlement.settled_categories,
+      transactions: settlement.settled_transactions,
+    } satisfies SettlementBatch;
   }
 
-  // Direction reversed — need to undo old + apply new
-  if (currentFrom !== settledFrom) {
-    const oldFrom = users.find((u) => u.id === settledFrom);
-    const oldTo = users.find((u) => u.id === settledTo);
-    const newFrom = users.find((u) => u.id === currentFrom);
-    const newTo = users.find((u) => u.id === currentTo);
+  if (settlement.settled_at) {
+    const settledAt = Date.parse(settlement.settled_at);
+    const frozenTransactions = currentRelevantTransactions.filter((transaction) => {
+      const createdAt = Date.parse(transaction.created_at);
+      if (Number.isNaN(settledAt) || Number.isNaN(createdAt)) {
+        return false;
+      }
 
-    // The person who paid (settledFrom) already paid settledAmount to settledTo.
-    // Now currentFrom owes currentAmount to currentTo.
-    // Net: settledTo owes settledAmount back + currentFrom owes currentAmount.
-    // If settledTo === currentFrom, net = currentAmount - settledAmount one-way
-    const netAmount = settledAmount + currentAmount;
+      return createdAt <= settledAt;
+    });
+    const breakdown = buildSettlementBreakdown(frozenTransactions, categories, users);
 
     return {
-      type: "reversal" as const,
-      fromUser: newFrom,
-      toUser: newTo,
-      amount: netAmount,
-      description: `Direction changed: ${oldTo?.name} should refund ${formatCurrency(settledAmount)}, then ${newFrom?.name} pays ${formatCurrency(currentAmount)} to ${newTo?.name} (net: ${formatCurrency(netAmount)})`,
-    };
+      id: `legacy-${settlement.id}`,
+      settled_at: settlement.settled_at,
+      amount: settlement.settled_amount ?? breakdown.transfer.amount,
+      shared_total: settlement.shared_total ?? breakdown.sharedTotal,
+      from_user_id: settlement.settled_from_user_id ?? breakdown.transfer.fromUserId,
+      to_user_id: settlement.settled_to_user_id ?? breakdown.transfer.toUserId,
+      users: breakdown.users,
+      categories: breakdown.categories,
+      transactions: breakdown.transactions,
+    } satisfies SettlementBatch;
   }
 
   return null;
 }
 
-function SettlementCard({
-  settlement,
-  users,
-  categories,
-  previousSettlement,
-  onToggleSettled,
-  onAcknowledgeAdjustment,
-  onRecalculate,
-}: {
-  settlement: Settlement;
-  users: User[];
-  categories: Category[];
-  previousSettlement: Settlement | null;
-  onToggleSettled: (id: string, isSettled: boolean) => void;
-  onAcknowledgeAdjustment: (id: string) => void;
-  onRecalculate: (month: string) => void;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const [transactions, setTransactions] = useState<Transaction[] | null>(null);
-  const [loadingTx, setLoadingTx] = useState(false);
-  const fetchDecrypted = useDecryptedFetch();
+function getStoredBatches(
+  settlement: Settlement | null,
+  currentRelevantTransactions: SettlementTransactionSnapshot[],
+  categories: Category[],
+  users: User[]
+) {
+  if (!settlement) {
+    return [];
+  }
 
-  const fromUser = users.find((u) => u.id === settlement.from_user_id);
-  const toUser = users.find((u) => u.id === settlement.to_user_id);
+  if (settlement.settlement_batches?.length) {
+    return [...settlement.settlement_batches].sort((left, right) =>
+      compareIso(left.settled_at, right.settled_at)
+    );
+  }
 
-  const adjustment = getAdjustment(settlement, users);
-
-  // Check if there's a carry-forward from the previous settled month
-  const previousAdjustment = previousSettlement
-    ? getAdjustment(previousSettlement, users)
-    : null;
-
-  // Get shared and cross-paid category IDs
-  const categoryById = new Map(categories.map((c) => [c.id, c]));
-  const sharedCategoryIds = new Set(
-    categories.filter((c) => c.split_type === "equal").map((c) => c.id)
+  const legacyBatch = buildLegacyBatch(
+    settlement,
+    currentRelevantTransactions,
+    categories,
+    users
   );
 
-  async function handleExpand() {
-    if (expanded) {
-      setExpanded(false);
-      return;
-    }
-    setExpanded(true);
+  return legacyBatch ? [legacyBatch] : [];
+}
 
-    if (transactions !== null) return;
+function getSignedTransferAmount(
+  transfer: SettlementTransfer,
+  firstUserId: string
+) {
+  if (!transfer.fromUserId || !transfer.toUserId || transfer.amount < 0.01) {
+    return 0;
+  }
 
-    setLoadingTx(true);
-    try {
-      const monthStr = settlement.month.slice(0, 7);
-      const allTx = await fetchDecrypted(`/api/transactions?month=${monthStr}`) as Transaction[];
-      // Include shared (equal) + cross-paid (full_payer where payer ≠ owner)
-      const settlementTx = allTx.filter((t) => {
-        if (!t.category_id) return false;
-        if (sharedCategoryIds.has(t.category_id)) return true;
-        const cat = categoryById.get(t.category_id);
-        return (
-          cat?.split_type === "full_payer" &&
-          cat.owner_user_id != null &&
-          t.user_id != null &&
-          cat.owner_user_id !== t.user_id
-        );
-      });
-      setTransactions(settlementTx);
-    } catch {
-      setTransactions([]);
-    } finally {
-      setLoadingTx(false);
+  return transfer.toUserId === firstUserId ? transfer.amount : -transfer.amount;
+}
+
+function buildSettlementPayload(
+  month: string,
+  notes: string | null,
+  monthTotalTransactions: SettlementTransactionSnapshot[],
+  categories: Category[],
+  users: User[],
+  settlementBatches: SettlementBatch[]
+) {
+  const includedIds = new Set(
+    settlementBatches.flatMap((batch) =>
+      batch.transactions.map((transaction) => transaction.id)
+    )
+  );
+  const pendingTransactions = monthTotalTransactions.filter(
+    (transaction) => !includedIds.has(transaction.id)
+  );
+  const pendingBreakdown = buildSettlementBreakdown(
+    pendingTransactions,
+    categories,
+    users
+  );
+  const latestBatch =
+    settlementBatches.length > 0
+      ? settlementBatches[settlementBatches.length - 1]
+      : null;
+
+  return {
+    month: `${month}-01`,
+    from_user_id: pendingBreakdown.transfer.fromUserId,
+    to_user_id: pendingBreakdown.transfer.toUserId,
+    amount: pendingBreakdown.transfer.amount,
+    shared_total: pendingBreakdown.sharedTotal,
+    notes,
+    settled_amount: latestBatch?.amount ?? null,
+    settled_from_user_id: latestBatch?.from_user_id ?? null,
+    settled_to_user_id: latestBatch?.to_user_id ?? null,
+    settled_users: latestBatch?.users ?? null,
+    settled_categories: latestBatch?.categories ?? null,
+    settled_transactions: latestBatch?.transactions ?? null,
+    settlement_batches: settlementBatches.length > 0 ? settlementBatches : null,
+  };
+}
+
+function buildMonthlySettlementViews(
+  settlements: Settlement[],
+  transactions: Transaction[],
+  categories: Category[],
+  users: User[]
+) {
+  const settlementByMonth = new Map<string, Settlement>();
+  for (const settlement of settlements) {
+    const currentMonth = monthKey(settlement.month);
+    if (currentMonth) {
+      settlementByMonth.set(currentMonth, settlement);
     }
   }
 
-  const user1 = users[0];
-  const user2 = users[1];
-  const user1Paid = transactions
-    ? transactions
-        .filter((t) => t.user_id === user1?.id)
-        .reduce((s, t) => s + Math.abs(t.amount), 0)
-    : 0;
-  const user2Paid = transactions
-    ? transactions
-        .filter((t) => t.user_id === user2?.id)
-        .reduce((s, t) => s + Math.abs(t.amount), 0)
-    : 0;
+  const months = new Set<string>();
+  for (const transaction of transactions) {
+    const currentMonth = monthKey(transaction.date);
+    if (currentMonth) {
+      months.add(currentMonth);
+    }
+  }
+  for (const currentMonth of settlementByMonth.keys()) {
+    months.add(currentMonth);
+  }
 
-  const monthStr = settlement.month.slice(0, 7);
+  const uncategorizedCategoryIds = new Set(
+    categories
+      .filter((category) => category.name === "uncategorized")
+      .map((category) => category.id)
+  );
+
+  return [...months]
+    .map((month) => {
+      const monthTransactions = transactions.filter((transaction) =>
+        isTransactionInMonth(transaction, month)
+      );
+      const monthTotal = buildSettlementBreakdown(
+        monthTransactions,
+        categories,
+        users
+      );
+      const record = settlementByMonth.get(month) ?? null;
+      const settledBatches = getStoredBatches(
+        record,
+        monthTotal.transactions,
+        categories,
+        users
+      );
+      const includedIds = new Set(
+        settledBatches.flatMap((batch) =>
+          batch.transactions.map((transaction) => transaction.id)
+        )
+      );
+      const pendingTransactions = monthTotal.transactions.filter(
+        (transaction) => !includedIds.has(transaction.id)
+      );
+      const pending = buildSettlementBreakdown(
+        pendingTransactions,
+        categories,
+        users
+      );
+      const uncategorizedTransactions = monthTransactions.filter(
+        (transaction) =>
+          !transaction.category_id ||
+          uncategorizedCategoryIds.has(transaction.category_id)
+      );
+
+      return {
+        month,
+        record,
+        monthTransactions,
+        monthTotal,
+        pending,
+        settledBatches,
+        uncategorizedCount: uncategorizedTransactions.length,
+        uncategorizedAmount: uncategorizedTransactions.reduce(
+          (sum, transaction) => sum + Math.abs(transaction.amount),
+          0
+        ),
+      } satisfies MonthlySettlementView;
+    })
+    .filter(
+      (view) =>
+        view.monthTransactions.length > 0 ||
+        view.settledBatches.length > 0 ||
+        view.record
+    )
+    .sort((left, right) => right.month.localeCompare(left.month));
+}
+
+function TransferSummary({
+  transfer,
+  users,
+  emptyLabel = "All settled",
+  amountClassName,
+}: {
+  transfer: SettlementTransfer;
+  users: User[];
+  emptyLabel?: string;
+  amountClassName?: string;
+}) {
+  if (!transfer.fromUserId || !transfer.toUserId || transfer.amount < 0.01) {
+    return (
+      <div className="rounded-lg bg-muted/60 px-4 py-3">
+        <p className="text-sm text-muted-foreground">{emptyLabel}</p>
+      </div>
+    );
+  }
+
+  const fromUser = users.find((user) => user.id === transfer.fromUserId);
+  const toUser = users.find((user) => user.id === transfer.toUserId);
+
+  if (!fromUser || !toUser) {
+    return (
+      <div className="rounded-lg bg-muted/60 px-4 py-3">
+        <p className="text-sm text-muted-foreground">{emptyLabel}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-3 rounded-lg bg-muted/60 px-4 py-3">
+      <span className="text-sm font-medium">{fromUser.name}</span>
+      <ArrowRight className="h-3.5 w-3.5 shrink-0 text-warm" />
+      <span className="text-sm font-medium">{toUser.name}</span>
+      <span className={cn("ml-auto font-heading text-lg font-bold", amountClassName)}>
+        {formatCurrency(transfer.amount)}
+      </span>
+    </div>
+  );
+}
+
+function UserSummaryGrid({
+  breakdown,
+  users,
+}: {
+  breakdown: SettlementBreakdown;
+  users: User[];
+}) {
+  return (
+    <div className="grid gap-3 md:grid-cols-2">
+      {breakdown.users.map((summary) => {
+        const user = users.find((candidate) => candidate.id === summary.userId);
+        const netLabel =
+          summary.net < -0.01
+            ? "Owes"
+            : summary.net > 0.01
+              ? "Gets back"
+              : "Balanced";
+        const netClassName =
+          summary.net < -0.01
+            ? "text-rose-700 dark:text-rose-300"
+            : summary.net > 0.01
+              ? "text-emerald-700 dark:text-emerald-300"
+              : "text-muted-foreground";
+
+        return (
+          <div key={summary.userId} className="rounded-lg border bg-background/80 p-4">
+            <p className="text-sm font-semibold">{user?.name || "Unknown user"}</p>
+            <div className="mt-3 space-y-1.5 text-sm">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">Paid</span>
+                <span className="font-mono">
+                  {formatSettlementMetric(summary.paid)}
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">Own share</span>
+                <span className="font-mono">
+                  {formatSettlementMetric(summary.owes)}
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-3 pt-1">
+                <span className="font-medium">{netLabel}</span>
+                <span className={cn("font-mono font-semibold", netClassName)}>
+                  {summary.net < 0
+                    ? formatCurrency(summary.net)
+                    : formatSignedCurrency(summary.net)}
+                </span>
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function CategorySummaryList({
+  breakdown,
+  users,
+  frozenTransactionIds,
+  highlight,
+  onOpenTransaction,
+}: {
+  breakdown: SettlementBreakdown;
+  users: User[];
+  frozenTransactionIds: Set<string>;
+  highlight?: boolean;
+  onOpenTransaction: (
+    transaction: SettlementTransactionSnapshot,
+    isFrozen: boolean
+  ) => void;
+}) {
+  const [expandedCategoryIds, setExpandedCategoryIds] = useState<Set<string>>(
+    () => new Set()
+  );
+
+  if (breakdown.categories.length === 0) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        No settlement categories in this section.
+      </p>
+    );
+  }
+
+  const transactionsByCategory = new Map<string, SettlementTransactionSnapshot[]>();
+  for (const transaction of breakdown.transactions) {
+    if (!transaction.category_id) {
+      continue;
+    }
+
+    const current = transactionsByCategory.get(transaction.category_id) || [];
+    current.push(transaction);
+    transactionsByCategory.set(transaction.category_id, current);
+  }
+
+  function toggleCategory(categoryId: string) {
+    setExpandedCategoryIds((current) => {
+      const next = new Set(current);
+      if (next.has(categoryId)) {
+        next.delete(categoryId);
+      } else {
+        next.add(categoryId);
+      }
+      return next;
+    });
+  }
+
+  return (
+    <div className="space-y-3">
+      {breakdown.categories.map((category) => {
+        const categoryTransactions =
+          transactionsByCategory.get(category.categoryId) || [];
+        const expanded = expandedCategoryIds.has(category.categoryId);
+
+        return (
+          <div key={category.categoryId} className="rounded-lg border bg-background/80 p-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold">{category.categoryName}</p>
+                <p className="text-xs text-muted-foreground">
+                  {category.splitType === "equal"
+                    ? "Shared split"
+                    : "Cross-paid private expense"}
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {users
+                    .map((user) => {
+                      const share = category.owesByUser[user.id] || 0;
+                      return `${user.name} ${formatSharePercent(
+                        share,
+                        category.total
+                      )}`;
+                    })
+                    .join(" • ")}
+                </p>
+              </div>
+              <div className="text-right">
+                <p className="font-mono text-sm font-semibold">
+                  {formatSettlementMetric(category.total)}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {category.transactionCount} transaction
+                  {category.transactionCount === 1 ? "" : "s"}
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-3 grid gap-2 md:grid-cols-2">
+              {users.map((user) => {
+                const share = category.owesByUser[user.id] || 0;
+
+                return (
+                  <div
+                    key={user.id}
+                    className="rounded-md bg-muted/40 px-3 py-2 text-sm"
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="font-medium">{user.name}</span>
+                      <span className="text-xs text-muted-foreground">
+                        {formatSharePercent(share, category.total)} share
+                      </span>
+                    </div>
+                    <div className="mt-2 flex items-center justify-between gap-3">
+                      <span className="text-muted-foreground">Paid</span>
+                      <span className="font-mono">
+                        {formatSettlementMetric(category.paidByUser[user.id] || 0)}
+                      </span>
+                    </div>
+                    <div className="mt-1 flex items-center justify-between gap-3">
+                      <span className="text-muted-foreground">Share</span>
+                      <span className="font-mono">
+                        {formatSettlementMetric(share)}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="mt-3 flex items-center justify-between gap-3">
+              <p className="text-xs text-muted-foreground">
+                {categoryTransactions.length} transaction
+                {categoryTransactions.length === 1 ? "" : "s"} in this category
+              </p>
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                onClick={() => toggleCategory(category.categoryId)}
+              >
+                {expanded ? (
+                  <ChevronUp className="mr-2 h-4 w-4" />
+                ) : (
+                  <ChevronDown className="mr-2 h-4 w-4" />
+                )}
+                {expanded ? "Hide" : "Show"} Transactions
+              </Button>
+            </div>
+
+            {expanded && (
+              <div className="mt-3 space-y-1.5">
+                {categoryTransactions.map((transaction) => {
+                  const payer = users.find(
+                    (user) => user.id === transaction.user_id
+                  );
+                  const isFrozen = frozenTransactionIds.has(transaction.id);
+
+                  return (
+                    <button
+                      key={transaction.id}
+                      type="button"
+                      onClick={() => onOpenTransaction(transaction, isFrozen)}
+                      className={cn(
+                        "w-full rounded-lg border px-3 py-2.5 text-left text-sm transition-colors hover:border-primary/40 hover:bg-accent/30",
+                        highlight
+                          ? "border-amber-200 bg-amber-50/70 dark:border-amber-900 dark:bg-amber-950/20"
+                          : "bg-background/80"
+                      )}
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                            <span className="font-mono">
+                              {formatTransactionDate(transaction.date)}
+                            </span>
+                            {payer && <span>{payer.name}</span>}
+                            {isFrozen && (
+                              <Badge variant="outline" className="h-4 px-1 text-[9px]">
+                                Settled
+                              </Badge>
+                            )}
+                          </div>
+                          <p className="mt-1 truncate font-medium">
+                            {transaction.enriched_name || transaction.description}
+                          </p>
+                        </div>
+                        <span
+                          className={cn(
+                            "font-mono font-medium",
+                            getAmountTone(transaction.amount)
+                          )}
+                        >
+                          {formatSignedCurrency(transaction.amount)}
+                        </span>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function BreakdownSection({
+  title,
+  description,
+  breakdown,
+  users,
+  tone = "default",
+  frozenTransactionIds,
+  onOpenTransaction,
+}: {
+  title: string;
+  description: string;
+  breakdown: SettlementBreakdown;
+  users: User[];
+  tone?: "default" | "warning";
+  frozenTransactionIds: Set<string>;
+  onOpenTransaction: (
+    transaction: SettlementTransactionSnapshot,
+    isFrozen: boolean
+  ) => void;
+}) {
+  return (
+    <div
+      className={cn(
+        "rounded-xl border px-4 py-4",
+        tone === "warning"
+          ? "border-amber-200 bg-amber-50/60 dark:border-amber-900 dark:bg-amber-950/20"
+          : "bg-muted/30"
+      )}
+    >
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h4 className="text-sm font-semibold">{title}</h4>
+          <p className="mt-1 text-sm text-muted-foreground">{description}</p>
+        </div>
+        <Badge variant={tone === "warning" ? "destructive" : "secondary"}>
+          {breakdown.transactionCount} tx
+        </Badge>
+      </div>
+
+      <div className="mt-4 space-y-4">
+        <TransferSummary
+          transfer={breakdown.transfer}
+          users={users}
+          emptyLabel="No balance in this section"
+          amountClassName={
+            tone === "warning" ? "text-amber-700 dark:text-amber-300" : undefined
+          }
+        />
+
+        <UserSummaryGrid breakdown={breakdown} users={users} />
+
+        <div>
+          <p className="mb-2 text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+            Categories
+          </p>
+          <CategorySummaryList
+            breakdown={breakdown}
+            users={users}
+            frozenTransactionIds={frozenTransactionIds}
+            highlight={tone === "warning"}
+            onOpenTransaction={onOpenTransaction}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SettledBatchCard({
+  batch,
+  batchNumber,
+  categories,
+  users,
+  onOpenTransaction,
+}: {
+  batch: SettlementBatch;
+  batchNumber: number;
+  categories: Category[];
+  users: User[];
+  onOpenTransaction: (
+    transaction: SettlementTransactionSnapshot,
+    isFrozen: boolean
+  ) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const breakdown = buildStoredBatchBreakdown(batch, categories, users);
+  const frozenTransactionIds = new Set(
+    batch.transactions.map((transaction) => transaction.id)
+  );
+
+  return (
+    <div className="rounded-xl border bg-background/70 px-4 py-4">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+            Settled Batch {batchNumber}
+          </p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Locked on {formatTimestamp(batch.settled_at)}
+          </p>
+        </div>
+        <Badge variant="default">
+          <Check className="mr-1 h-3 w-3" />
+          Settled
+        </Badge>
+      </div>
+
+      <div className="mt-3">
+        <TransferSummary
+          transfer={breakdown.transfer}
+          users={users}
+          emptyLabel="This batch was balanced"
+        />
+      </div>
+
+      <div className="mt-3 flex items-center justify-between gap-3">
+        <p className="text-sm text-muted-foreground">
+          {breakdown.transactionCount} transactions in this settled batch.
+        </p>
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => setExpanded((current) => !current)}
+        >
+          {expanded ? (
+            <ChevronUp className="mr-2 h-4 w-4" />
+          ) : (
+            <ChevronDown className="mr-2 h-4 w-4" />
+          )}
+          {expanded ? "Hide" : "Show"} Batch Details
+        </Button>
+      </div>
+
+      {expanded && (
+        <div className="mt-4">
+          <BreakdownSection
+            title={`Settled Batch ${batchNumber}`}
+            description="These numbers were frozen at the time this batch was settled."
+            breakdown={breakdown}
+            users={users}
+            frozenTransactionIds={frozenTransactionIds}
+            onOpenTransaction={onOpenTransaction}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SettlementCard({
+  busy,
+  categories,
+  onOpenTransaction,
+  onReopenLatestBatch,
+  onSettleCurrentBatch,
+  users,
+  view,
+}: {
+  busy: boolean;
+  categories: Category[];
+  onOpenTransaction: (
+    transaction: SettlementTransactionSnapshot,
+    isFrozen: boolean
+  ) => void;
+  onReopenLatestBatch: (view: MonthlySettlementView) => Promise<void>;
+  onSettleCurrentBatch: (view: MonthlySettlementView) => Promise<void>;
+  users: User[];
+  view: MonthlySettlementView;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const hasPending = view.pending.transactionCount > 0;
+  const hasUncategorized = view.uncategorizedCount > 0;
+  const settledTransactionIds = new Set(
+    view.settledBatches.flatMap((batch) =>
+      batch.transactions.map((transaction) => transaction.id)
+    )
+  );
 
   return (
     <Card className="animate-fade-up">
-      <CardContent className="pt-5 pb-5 px-6">
-        {/* Header row */}
-        <div className="flex items-start justify-between mb-4">
+      <CardContent className="px-6 py-5">
+        <div className="flex items-start justify-between gap-4">
           <div>
             <h3 className="font-heading text-xl font-bold tracking-tight">
-              {format(new Date(settlement.month), "MMMM yyyy")}
+              {format(monthDate(view.month), "MMMM yyyy")}
             </h3>
-            <p className="text-sm text-muted-foreground mt-0.5">
-              Shared total: <span className="font-mono font-medium text-foreground">{formatCurrency(settlement.shared_total || 0)}</span>
+            <p className="mt-0.5 text-sm text-muted-foreground">
+              {view.settledBatches.length} settled batch
+              {view.settledBatches.length === 1 ? "" : "es"} in this month
             </p>
           </div>
+
           <div className="flex items-center gap-2">
-            {adjustment && (
-              <Badge variant="destructive" className="shrink-0">
-                <AlertTriangle className="h-3 w-3 mr-1" />
-                Adjusted
+            {hasUncategorized && (
+              <Badge variant="destructive">
+                <AlertTriangle className="mr-1 h-3 w-3" />
+                Uncategorized
               </Badge>
             )}
-            <Badge
-              variant={settlement.is_settled ? "default" : "secondary"}
-              className="shrink-0"
-            >
-              {settlement.is_settled ? (
+            <Badge variant={hasPending ? "secondary" : "default"}>
+              {hasPending ? (
                 <span className="flex items-center gap-1">
-                  <Check className="h-3 w-3" /> Settled
+                  <Clock className="h-3 w-3" />
+                  Pending Batch
                 </span>
               ) : (
                 <span className="flex items-center gap-1">
-                  <Clock className="h-3 w-3" /> Pending
+                  <Check className="h-3 w-3" />
+                  Up To Date
                 </span>
               )}
             </Badge>
           </div>
         </div>
 
-        {/* Adjustment alert for settled months */}
-        {adjustment && (
-          <div className="rounded-lg border border-amber-300 bg-amber-50 dark:border-amber-800 dark:bg-amber-950/30 px-4 py-3 mb-4 space-y-3">
-            <div className="flex items-start gap-2">
-              <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400 mt-0.5 shrink-0" />
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-medium text-amber-800 dark:text-amber-300">
-                  Settlement changed after marking as settled
-                </p>
-                <p className="text-sm text-amber-700 dark:text-amber-400 mt-1">
-                  {adjustment.description}
-                </p>
-                <div className="flex items-center gap-3 mt-2 text-sm">
-                  <span className="text-muted-foreground">
-                    Was: <span className="font-mono font-medium">{formatCurrency(settlement.settled_amount || 0)}</span>
-                  </span>
-                  <ArrowRight className="h-3 w-3 text-muted-foreground" />
-                  <span className="text-foreground">
-                    Now: <span className="font-mono font-medium">{formatCurrency(settlement.amount)}</span>
-                  </span>
-                </div>
-              </div>
+        <div className="mt-4 rounded-xl border bg-muted/30 px-4 py-4">
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+            Month Total
+          </p>
+          <div className="mt-3">
+            <TransferSummary
+              transfer={view.monthTotal.transfer}
+              users={users}
+              emptyLabel="The month is balanced overall"
+            />
+          </div>
+          <div className="mt-3 grid gap-3 md:grid-cols-3">
+            <div className="rounded-lg bg-background/80 px-3 py-3">
+              <p className="text-xs text-muted-foreground">Net settlement activity</p>
+              <p className="mt-1 font-mono font-semibold">
+                {formatSettlementMetric(view.monthTotal.relevantTotal)}
+              </p>
             </div>
-            <div className="flex items-center gap-2 pl-6">
-              <Button
-                size="sm"
-                variant="default"
-                onClick={() => onAcknowledgeAdjustment(settlement.id)}
-              >
-                <Check className="mr-1 h-3.5 w-3.5" />
-                Adjustment Done
-              </Button>
-              <p className="text-xs text-amber-600 dark:text-amber-500">
-                Click after transferring the difference
+            <div className="rounded-lg bg-background/80 px-3 py-3">
+              <p className="text-xs text-muted-foreground">Settlement transactions</p>
+              <p className="mt-1 font-mono font-semibold">
+                {view.monthTotal.transactionCount}
+              </p>
+            </div>
+            <div className="rounded-lg bg-background/80 px-3 py-3">
+              <p className="text-xs text-muted-foreground">Open batch transfer</p>
+              <p className="mt-1 font-mono font-semibold">
+                {formatCurrency(view.pending.transfer.amount)}
               </p>
             </div>
           </div>
-        )}
+        </div>
 
-        {/* Carry-forward notice from previous month */}
-        {previousAdjustment && !settlement.is_settled && (
-          <div className="rounded-lg border border-blue-200 bg-blue-50 dark:border-blue-800 dark:bg-blue-950/30 px-4 py-3 mb-4">
+        {hasUncategorized && (
+          <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50/80 px-4 py-4 dark:border-amber-900 dark:bg-amber-950/20">
             <div className="flex items-start gap-2">
-              <RefreshCw className="h-4 w-4 text-blue-600 dark:text-blue-400 mt-0.5 shrink-0" />
-              <div className="flex-1">
-                <p className="text-sm font-medium text-blue-800 dark:text-blue-300">
-                  Previous month has an unresolved adjustment
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-700 dark:text-amber-300" />
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-amber-800 dark:text-amber-300">
+                  Categorize all transactions before settling this month
                 </p>
-                <p className="text-xs text-blue-600 dark:text-blue-400 mt-0.5">
-                  You can clear last month&apos;s remaining balance ({formatCurrency(previousAdjustment.amount)}) together with this month&apos;s settlement in one transaction.
+                <p className="mt-1 text-sm text-amber-700 dark:text-amber-300">
+                  {view.uncategorizedCount} uncategorized transaction
+                  {view.uncategorizedCount === 1 ? "" : "s"} worth{" "}
+                  {formatCurrency(view.uncategorizedAmount)} still need a category.
                 </p>
-                {fromUser && toUser && (
-                  <p className="text-sm font-medium text-blue-800 dark:text-blue-300 mt-1.5">
-                    Combined: {fromUser.name} <ArrowRight className="inline h-3 w-3 mx-1" /> {toUser.name}: <span className="font-mono">{formatCurrency(settlement.amount + previousAdjustment.amount)}</span>
-                  </p>
-                )}
               </div>
             </div>
           </div>
         )}
 
-        {/* Settlement summary */}
-        {settlement.amount > 0 && fromUser && toUser ? (
-          <div className="flex items-center gap-3 rounded-lg bg-muted/50 px-4 py-3 mb-4">
-            <span className="text-sm font-medium">{fromUser.name}</span>
-            <ArrowRight className="h-3.5 w-3.5 text-warm shrink-0" />
-            <span className="text-sm font-medium">{toUser.name}</span>
-            <span className="ml-auto font-heading text-lg font-bold">
-              {formatCurrency(settlement.amount)}
-            </span>
+        <div className="mt-4 rounded-xl border border-blue-200 bg-blue-50/70 px-4 py-4 dark:border-blue-900 dark:bg-blue-950/20">
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-blue-800 dark:text-blue-300">
+            Current Pending Batch
+          </p>
+          <div className="mt-3">
+            <TransferSummary
+              transfer={view.pending.transfer}
+              users={users}
+              emptyLabel="No new settlement-affecting transactions since the last settled batch"
+              amountClassName="text-blue-800 dark:text-blue-300"
+            />
           </div>
-        ) : (
-          <div className="rounded-lg bg-muted/50 px-4 py-3 mb-4">
-            <p className="text-sm text-muted-foreground">All settled — no balance owed</p>
-          </div>
-        )}
+          <p className="mt-2 text-sm text-blue-800 dark:text-blue-300">
+            {hasPending
+              ? `${view.pending.transactionCount} transactions are waiting to be settled as the next batch.`
+              : "Newly imported transactions in this month will appear here as a separate batch."}
+          </p>
+        </div>
 
-        {/* Actions */}
-        <div className="flex items-center gap-2 flex-wrap">
+        <div className="mt-4 flex flex-wrap items-center gap-2">
           <Button
-            variant={settlement.is_settled ? "outline" : "default"}
             size="sm"
-            onClick={() =>
-              onToggleSettled(settlement.id, !settlement.is_settled)
-            }
+            onClick={() => void onSettleCurrentBatch(view)}
+            disabled={busy || !hasPending || hasUncategorized}
           >
-            {settlement.is_settled ? "Mark as Pending" : "Mark as Settled"}
+            {busy ? (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <Check className="mr-2 h-4 w-4" />
+            )}
+            Mark Current Batch as Settled
           </Button>
+          {view.settledBatches.length > 0 && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void onReopenLatestBatch(view)}
+              disabled={busy}
+            >
+              <RotateCcw className="mr-2 h-4 w-4" />
+              Reopen Latest Settled Batch
+            </Button>
+          )}
           <Button
-            variant="ghost"
             size="sm"
-            onClick={() => onRecalculate(monthStr)}
-            title="Recalculate this settlement"
-          >
-            <RefreshCw className="mr-1 h-4 w-4" />
-            Recalculate
-          </Button>
-          <Button
             variant="ghost"
-            size="sm"
-            onClick={handleExpand}
+            onClick={() => setExpanded((current) => !current)}
           >
             {expanded ? (
-              <ChevronUp className="mr-1 h-4 w-4" />
+              <ChevronUp className="mr-2 h-4 w-4" />
             ) : (
-              <ChevronDown className="mr-1 h-4 w-4" />
+              <ChevronDown className="mr-2 h-4 w-4" />
             )}
-            {expanded ? "Hide" : "Show"} Breakdown
+            {expanded ? "Hide" : "Show"} Details
           </Button>
         </div>
 
-        {/* Expanded breakdown */}
         {expanded && (
           <>
             <Separator className="my-4" />
 
-            {loadingTx ? (
-              <div className="flex items-center justify-center py-6">
-                <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
-                <span className="ml-2 text-sm text-muted-foreground">Loading transactions...</span>
-              </div>
-            ) : transactions && transactions.length > 0 ? (
-              <div className="space-y-4">
-                {/* Per-user paid summary */}
-                {user1 && user2 && (
-                  <div className="grid grid-cols-2 gap-3 text-sm">
-                    <div className="rounded-md bg-primary/5 px-3 py-2">
-                      <p className="text-[11px] uppercase tracking-wider text-muted-foreground mb-0.5">{user1.name} paid</p>
-                      <p className="font-mono font-semibold">{formatCurrency(user1Paid)}</p>
-                    </div>
-                    <div className="rounded-md bg-warm/5 px-3 py-2">
-                      <p className="text-[11px] uppercase tracking-wider text-muted-foreground mb-0.5">{user2.name} paid</p>
-                      <p className="font-mono font-semibold">{formatCurrency(user2Paid)}</p>
-                    </div>
-                  </div>
-                )}
+            <div className="space-y-4">
+              <BreakdownSection
+                title="Month Total"
+                description="This is the full month summary across every settlement batch and the current pending batch."
+                breakdown={view.monthTotal}
+                users={users}
+                frozenTransactionIds={settledTransactionIds}
+                onOpenTransaction={onOpenTransaction}
+              />
 
-                {/* Transaction list */}
-                <div className="max-h-72 overflow-y-auto space-y-0.5">
-                  {transactions
-                    .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
-                    .map((t) => {
-                      const txUser = users.find((u) => u.id === t.user_id);
-                      return (
-                        <div
-                          key={t.id}
-                          className="flex items-center justify-between rounded-md px-3 py-2 text-sm hover:bg-muted/50 transition-colors"
-                        >
-                          <div className="flex items-center gap-2.5 min-w-0 flex-1">
-                            <span className="text-xs text-muted-foreground shrink-0 font-mono w-12">
-                              {format(new Date(t.date), "MMM d")}
-                            </span>
-                            <span className="truncate">
-                              {t.enriched_name || t.description}
-                            </span>
-                            {txUser && (
-                              <Badge variant="outline" className="text-[10px] shrink-0 px-1.5 py-0">
-                                {txUser.name?.split(" ")[0]}
-                              </Badge>
-                            )}
-                          </div>
-                          <span className="font-mono text-sm shrink-0 ml-3 tabular-nums">
-                            {formatCurrency(t.amount)}
-                          </span>
-                        </div>
-                      );
-                    })}
+              <BreakdownSection
+                title="Current Pending Batch"
+                description="These are the transactions that would be frozen if you settle the month right now."
+                breakdown={view.pending}
+                users={users}
+                tone="warning"
+                frozenTransactionIds={new Set()}
+                onOpenTransaction={onOpenTransaction}
+              />
+
+              {view.settledBatches.length > 0 && (
+                <div className="space-y-3">
+                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                    Settled Batches
+                  </p>
+                  {[...view.settledBatches]
+                    .reverse()
+                    .map((batch, index) => (
+                      <SettledBatchCard
+                        key={batch.id}
+                        batch={batch}
+                        batchNumber={view.settledBatches.length - index}
+                        categories={categories}
+                        users={users}
+                        onOpenTransaction={onOpenTransaction}
+                      />
+                    ))}
                 </div>
-              </div>
-            ) : (
-              <p className="text-sm text-muted-foreground text-center py-4">
-                No shared transactions found for this month
-              </p>
-            )}
+              )}
+            </div>
           </>
         )}
       </CardContent>
@@ -411,205 +1091,361 @@ function SettlementCard({
 }
 
 export default function SettlementsPage() {
-  const [settlements, setSettlements] = useState<Settlement[]>([]);
-  const [users, setUsers] = useState<User[]>([]);
-  const [categories, setCategories] = useState<Category[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [calculating, setCalculating] = useState(false);
+  const {
+    categories,
+    household,
+    loading: dataLoading,
+    refreshSettlements,
+    refreshTransactions,
+    settlements,
+    transactions,
+    updateTransactions,
+    users,
+    lastFetched,
+  } = useData();
 
-  const fetchData = useCallback(async () => {
-    setLoading(true);
-    try {
-      const [settRes, catRes, usersRes] = await Promise.all([
-        fetch("/api/settlements"),
-        fetch("/api/categories"),
-        fetch("/api/users"),
-      ]);
-
-      const dek = getDEK();
-      if (settRes.ok) {
-        const rawSett = await settRes.json();
-        setSettlements(await decryptEntities(rawSett, dek) as unknown as Settlement[]);
-      }
-      if (catRes.ok) {
-        const rawCats = await catRes.json();
-        setCategories(await decryptEntities(rawCats, dek) as unknown as Category[]);
-      }
-      if (usersRes.ok) {
-        const rawUsers = await usersRes.json();
-        setUsers(await decryptEntities(rawUsers, dek) as unknown as User[]);
-      }
-    } catch {
-      // silent
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const [busyMonth, setBusyMonth] = useState<string | null>(null);
+  const [detailState, setDetailState] = useState<SettlementDetailState | null>(
+    null
+  );
+  const [enriching, setEnriching] = useState(false);
+  const didRefreshRef = useRef(false);
+  const participants = getSettlementParticipants(users);
+  const loading = dataLoading && lastFetched === 0;
 
   useEffect(() => {
-    fetchData();
-  }, [fetchData]);
+    if (didRefreshRef.current) return;
+    didRefreshRef.current = true;
+    void Promise.all([refreshTransactions(), refreshSettlements()]);
+  }, [refreshSettlements, refreshTransactions]);
 
-  async function handleCalculate() {
-    setCalculating(true);
+  const monthlyViews = participants
+    ? buildMonthlySettlementViews(settlements, transactions, categories, participants)
+    : [];
+
+  const outstandingNet = participants
+    ? monthlyViews.reduce(
+        (sum, view) =>
+          sum + getSignedTransferAmount(view.pending.transfer, participants[0].id),
+        0
+      )
+    : 0;
+
+  const totalOutstandingTransfer: SettlementTransfer = participants
+    ? Math.abs(outstandingNet) < 0.01
+      ? { fromUserId: null, toUserId: null, amount: 0 }
+      : outstandingNet > 0
+        ? {
+            fromUserId: participants[1].id,
+            toUserId: participants[0].id,
+            amount: outstandingNet,
+          }
+        : {
+            fromUserId: participants[0].id,
+            toUserId: participants[1].id,
+            amount: Math.abs(outstandingNet),
+          }
+    : { fromUserId: null, toUserId: null, amount: 0 };
+
+  const pendingMonths = monthlyViews.filter(
+    (view) => view.pending.transactionCount > 0
+  ).length;
+  const settledBatches = monthlyViews.reduce(
+    (sum, view) => sum + view.settledBatches.length,
+    0
+  );
+  const blockedMonths = monthlyViews.filter(
+    (view) => view.uncategorizedCount > 0
+  ).length;
+
+  function handleOpenTransaction(
+    transaction: SettlementTransactionSnapshot,
+    isFrozen: boolean
+  ) {
+    const liveTransaction = transactions.find(
+      (candidate) => candidate.id === transaction.id
+    );
+
+    if (!liveTransaction) {
+      toast.error("Could not load the full transaction details");
+      return;
+    }
+
+    setDetailState({ transaction: liveTransaction, isFrozen });
+  }
+
+  async function handleEnrichTransaction(transaction: Transaction) {
+    setEnriching(true);
+
     try {
-      const month = format(new Date(), "yyyy-MM");
-      const res = await fetch("/api/settlements", {
+      const res = await fetch("/api/enrich", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ month }),
+        body: JSON.stringify({ transactionIds: [transaction.id] }),
       });
 
       if (!res.ok) {
-        const data = await res.json();
-        toast.error(data.error || "Failed to calculate settlement");
+        const data = await res.json().catch(() => ({}));
+        toast.error(data.error || "Failed to enrich");
         return;
       }
 
-      toast.success("Settlement calculated");
-      fetchData();
+      const result = await res.json();
+      if (result.enriched <= 0) {
+        toast.error("Enrichment failed");
+        return;
+      }
+
+      const transactionRes = await fetch(`/api/transactions/${transaction.id}`);
+      if (!transactionRes.ok) {
+        toast.error("Failed to refresh transaction details");
+        return;
+      }
+
+      const updated = await transactionRes.json();
+      updateTransactions((current) =>
+        current.map((candidate) =>
+          candidate.id === updated.id ? updated : candidate
+        )
+      );
+      setDetailState((current) =>
+        current ? { ...current, transaction: updated } : current
+      );
+      toast.success("Transaction enriched");
     } catch {
-      toast.error("Failed to calculate settlement");
+      toast.error("Failed to enrich transaction");
     } finally {
-      setCalculating(false);
+      setEnriching(false);
     }
   }
 
-  async function handleRecalculate(month: string) {
+  function handleUpdateTransaction(updated: Transaction) {
+    updateTransactions((current) =>
+      current.map((transaction) =>
+        transaction.id === updated.id ? updated : transaction
+      )
+    );
+    setDetailState((current) =>
+      current ? { ...current, transaction: updated } : current
+    );
+  }
+
+  async function upsertSettlementMonth(
+    view: MonthlySettlementView,
+    settlementBatches: SettlementBatch[]
+  ) {
+    if (!participants || !household?.id) {
+      throw new Error("Missing household data");
+    }
+
+    const settlementHash = await generateSettlementHash(household.id, view.month);
+    const encryptedData = await encryptSettlement(
+      buildSettlementPayload(
+        view.month,
+        view.record?.notes || null,
+        view.monthTotal.transactions,
+        categories,
+        participants,
+        settlementBatches
+      )
+    );
+
+    const latestBatch =
+      settlementBatches.length > 0
+        ? settlementBatches[settlementBatches.length - 1]
+        : null;
+
+    const res = await fetch("/api/settlements", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        settlement_hash: settlementHash,
+        encrypted_data: encryptedData,
+        is_settled: settlementBatches.length > 0,
+        settled_at: latestBatch?.settled_at ?? null,
+      }),
+    });
+
+    if (!res.ok) {
+      throw new Error("Failed to save settlement");
+    }
+  }
+
+  async function handleSettleCurrentBatch(view: MonthlySettlementView) {
+    if (!participants) {
+      toast.error("Add both users before creating settlements");
+      return;
+    }
+
+    if (!household?.id) {
+      toast.error("Household not loaded");
+      return;
+    }
+
+    if (view.uncategorizedCount > 0) {
+      toast.error("Categorize all transactions in this month before settling");
+      return;
+    }
+
+    if (view.pending.transactionCount === 0) {
+      toast.error("There is no pending batch to settle");
+      return;
+    }
+
+    setBusyMonth(view.month);
+
     try {
-      const res = await fetch("/api/settlements", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ month }),
-      });
+      const newBatch: SettlementBatch = {
+        id: crypto.randomUUID(),
+        settled_at: new Date().toISOString(),
+        amount: view.pending.transfer.amount,
+        shared_total: view.pending.sharedTotal,
+        from_user_id: view.pending.transfer.fromUserId,
+        to_user_id: view.pending.transfer.toUserId,
+        users: view.pending.users,
+        categories: view.pending.categories,
+        transactions: view.pending.transactions,
+      };
 
-      if (!res.ok) {
-        const data = await res.json();
-        toast.error(data.error || "Failed to recalculate");
-        return;
-      }
-
-      toast.success("Settlement recalculated");
-      fetchData();
+      await upsertSettlementMonth(view, [...view.settledBatches, newBatch]);
+      await refreshSettlements();
+      toast.success("Current batch settled");
     } catch {
-      toast.error("Failed to recalculate settlement");
+      toast.error("Failed to settle current batch");
+    } finally {
+      setBusyMonth(null);
     }
   }
 
-  async function handleToggleSettled(id: string, isSettled: boolean) {
+  async function handleReopenLatestBatch(view: MonthlySettlementView) {
+    if (view.settledBatches.length === 0) {
+      toast.error("There is no settled batch to reopen");
+      return;
+    }
+
+    setBusyMonth(view.month);
+
     try {
-      const res = await fetch(`/api/settlements/${id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ is_settled: isSettled }),
-      });
-
-      if (!res.ok) {
-        toast.error("Failed to update settlement");
-        return;
-      }
-
-      const updated = await res.json();
-      setSettlements((prev) =>
-        prev.map((s) => (s.id === id ? updated : s))
-      );
-
-      toast.success(isSettled ? "Marked as settled" : "Marked as pending");
+      const nextBatches = view.settledBatches.slice(0, -1);
+      await upsertSettlementMonth(view, nextBatches);
+      await refreshSettlements();
+      toast.success("Latest settled batch reopened");
     } catch {
-      toast.error("Failed to update settlement");
+      toast.error("Failed to reopen latest batch");
+    } finally {
+      setBusyMonth(null);
     }
   }
 
-  async function handleAcknowledgeAdjustment(id: string) {
-    try {
-      const res = await fetch(`/api/settlements/${id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ acknowledge_adjustment: true }),
-      });
-
-      if (!res.ok) {
-        toast.error("Failed to acknowledge adjustment");
-        return;
-      }
-
-      const updated = await res.json();
-      setSettlements((prev) =>
-        prev.map((s) => (s.id === id ? updated : s))
-      );
-
-      toast.success("Adjustment acknowledged");
-    } catch {
-      toast.error("Failed to acknowledge adjustment");
-    }
+  if (loading || !participants) {
+    return (
+      <div className="flex items-center justify-center py-20">
+        <div className="flex flex-col items-center gap-3">
+          <div className="h-8 w-8 rounded-full border-2 border-primary/20 border-t-primary animate-spin" />
+          <p className="text-sm text-muted-foreground">Loading settlements...</p>
+        </div>
+      </div>
+    );
   }
-
-  const sortedSettlements = [...settlements].sort(
-    (a, b) => b.month.localeCompare(a.month)
-  );
 
   return (
-    <div className="max-w-3xl mx-auto space-y-6">
-      <div className="flex items-end justify-between gap-4 animate-fade-up">
-        <div>
-          <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-muted-foreground mb-1">
-            Monthly
-          </p>
-          <h1 className="font-heading text-3xl font-bold tracking-tight">Settlements</h1>
-        </div>
-        <Button onClick={handleCalculate} disabled={calculating} className="shrink-0">
-          {calculating ? (
-            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-          ) : (
-            <Calculator className="mr-2 h-4 w-4" />
-          )}
-          {calculating ? "Calculating..." : "Calculate Current Month"}
-        </Button>
-      </div>
-
-      <div className="h-px bg-gradient-to-r from-border via-border to-transparent" />
-
-      {loading ? (
-        <div className="flex items-center justify-center py-20">
-          <div className="flex flex-col items-center gap-3">
-            <div className="h-8 w-8 rounded-full border-2 border-primary/20 border-t-primary animate-spin" />
-            <p className="text-sm text-muted-foreground">Loading...</p>
+    <div className="mx-auto max-w-5xl space-y-6">
+      <div className="animate-fade-up">
+        <div className="flex items-end justify-between gap-4">
+          <div>
+            <p className="mb-1 text-[11px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
+              Monthly
+            </p>
+            <h1 className="font-heading text-3xl font-bold tracking-tight">
+              Settlements
+            </h1>
           </div>
         </div>
-      ) : sortedSettlements.length === 0 ? (
-        <Card className="animate-fade-up">
-          <CardContent className="flex flex-col items-center justify-center py-16">
-            <div className="h-12 w-12 rounded-full bg-muted flex items-center justify-center mb-4">
-              <Calculator className="h-5 w-5 text-muted-foreground" />
+        <div className="mt-3 h-px bg-gradient-to-r from-border via-border to-transparent" />
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-3">
+        <Card className="animate-fade-up stagger-1 md:col-span-2">
+          <CardContent className="px-6 py-5">
+            <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+              Total Outstanding
+            </p>
+            <p className="mt-2 text-sm text-muted-foreground">
+              Net across the currently open batch in every month. Shared
+              positive income or refunds reduce the shared settlement total.
+            </p>
+            <div className="mt-4">
+              <TransferSummary
+                transfer={totalOutstandingTransfer}
+                users={participants}
+                emptyLabel="Everything is currently settled"
+              />
             </div>
+          </CardContent>
+        </Card>
+
+        <Card className="animate-fade-up stagger-2">
+          <CardContent className="grid gap-4 px-6 py-5">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                Pending Months
+              </p>
+              <p className="mt-1 font-heading text-2xl font-bold">{pendingMonths}</p>
+            </div>
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                Settled Batches
+              </p>
+              <p className="mt-1 font-heading text-2xl font-bold">{settledBatches}</p>
+            </div>
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                Blocked By Uncategorized
+              </p>
+              <p className="mt-1 font-heading text-2xl font-bold">{blockedMonths}</p>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      {monthlyViews.length === 0 ? (
+        <Card className="animate-fade-up">
+          <CardContent className="px-6 py-14">
             <p className="font-heading text-lg font-semibold">No settlements yet</p>
-            <p className="text-sm text-muted-foreground mt-1">
-              Calculate your first settlement to get started
+            <p className="mt-2 text-sm text-muted-foreground">
+              As soon as shared or cross-paid transactions exist, monthly settlement
+              summaries will show up here automatically.
             </p>
           </CardContent>
         </Card>
       ) : (
         <div className="space-y-4">
-          {sortedSettlements.map((s, i) => {
-            // Find the previous month's settlement (next in sorted array since sorted desc)
-            const prevSettlement = sortedSettlements[i + 1] || null;
-
-            return (
-              <div key={s.id} className={`stagger-${Math.min(i + 1, 5)}`}>
-                <SettlementCard
-                  settlement={s}
-                  users={users}
-                  categories={categories}
-                  previousSettlement={prevSettlement}
-                  onToggleSettled={handleToggleSettled}
-                  onAcknowledgeAdjustment={handleAcknowledgeAdjustment}
-                  onRecalculate={handleRecalculate}
-                />
-              </div>
-            );
-          })}
+          {monthlyViews.map((view, index) => (
+            <div key={view.month} className={`stagger-${Math.min(index + 1, 5)}`}>
+              <SettlementCard
+                busy={busyMonth === view.month}
+                categories={categories}
+                onOpenTransaction={handleOpenTransaction}
+                onReopenLatestBatch={handleReopenLatestBatch}
+                onSettleCurrentBatch={handleSettleCurrentBatch}
+                users={participants}
+                view={view}
+              />
+            </div>
+          ))}
         </div>
       )}
+
+      <TransactionDetailDialog
+        transaction={detailState?.transaction ?? null}
+        categories={categories}
+        users={participants}
+        isFrozen={detailState?.isFrozen ?? false}
+        enriching={enriching}
+        onClose={() => setDetailState(null)}
+        onEnrich={handleEnrichTransaction}
+        onUpdate={handleUpdateTransaction}
+      />
     </div>
   );
 }

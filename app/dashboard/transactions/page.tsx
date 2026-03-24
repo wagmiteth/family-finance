@@ -43,27 +43,18 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-} from "@/components/ui/dialog";
-import { Separator } from "@/components/ui/separator";
-import {
   ChevronLeft,
   ChevronRight,
   Sparkles,
   Loader2,
   GripVertical,
   Wand2,
-  Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
-import type { Transaction, Category, User, MerchantRule } from "@/lib/types";
-import { useDecryptedFetch } from "@/lib/crypto/use-decrypted-fetch";
-import { decryptEntity, decryptEntities, encryptTransaction, encryptMerchantRule } from "@/lib/crypto/entity-crypto";
-import { getDEK } from "@/lib/crypto/key-store";
+import type { Transaction, Category, User, MerchantRule, Settlement } from "@/lib/types";
+import { encryptMerchantRule } from "@/lib/crypto/entity-crypto";
+import { useData } from "@/lib/crypto/data-provider";
+import { TransactionDetailDialog } from "@/components/transaction-detail-dialog";
 
 function formatCurrency(amount: number) {
   return Math.abs(amount).toLocaleString("sv-SE", {
@@ -74,12 +65,78 @@ function formatCurrency(amount: number) {
   });
 }
 
+function formatSignedCurrency(amount: number) {
+  if (Math.abs(amount) < 0.01) {
+    return formatCurrency(0);
+  }
+
+  return `${amount > 0 ? "+" : "-"}${formatCurrency(amount)}`;
+}
+
+function getTransactionAmountClassName(amount: number) {
+  return amount >= 0
+    ? "text-green-600 dark:text-green-400"
+    : "text-muted-foreground";
+}
+
+function getSettledTransactionIds(settlements: Settlement[]) {
+  const ids = new Set<string>();
+
+  for (const settlement of settlements) {
+    if (settlement.settlement_batches?.length) {
+      for (const batch of settlement.settlement_batches) {
+        for (const transaction of batch.transactions || []) {
+          ids.add(transaction.id);
+        }
+      }
+      continue;
+    }
+
+    for (const transaction of settlement.settled_transactions || []) {
+      ids.add(transaction.id);
+    }
+  }
+
+  return ids;
+}
+
+function splitMutableTransactionIds(
+  ids: string[],
+  settledTransactionIds: Set<string>
+) {
+  const mutableIds: string[] = [];
+  let frozenCount = 0;
+
+  for (const id of ids) {
+    if (settledTransactionIds.has(id)) {
+      frozenCount += 1;
+    } else {
+      mutableIds.push(id);
+    }
+  }
+
+  return { mutableIds, frozenCount };
+}
+
+function toastSettledTransactionsLocked() {
+  toast.error("Settled transactions are locked. You can still add notes.");
+}
+
+function toastSkippedFrozenTransactions(frozenCount: number) {
+  if (frozenCount > 0) {
+    toast.warning(
+      `Skipped ${frozenCount} settled transaction${frozenCount === 1 ? "" : "s"} because payer and category are locked`
+    );
+  }
+}
+
 // ─── Draggable Transaction Card ──────────────────────────────────────────────
 
 function TransactionCard({
   transaction,
   categories,
   users,
+  isFrozen,
   isSelected,
   isMultiDragSource,
   selectedCount,
@@ -91,6 +148,7 @@ function TransactionCard({
   transaction: Transaction;
   categories: Category[];
   users: User[];
+  isFrozen: boolean;
   isSelected: boolean;
   isMultiDragSource: boolean;
   selectedCount: number;
@@ -101,11 +159,11 @@ function TransactionCard({
 }) {
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id: transaction.id,
+    disabled: isFrozen,
   });
 
   const user = users.find((u) => u.id === transaction.user_id);
   const userIndex = users.findIndex((u) => u.id === transaction.user_id);
-  const userColor = userIndex === 0 ? "border-primary text-primary" : "border-warm text-warm";
   const category = categories.find((c) => c.id === transaction.category_id);
 
   const isHidden = isDragging || isMultiDragSource;
@@ -120,52 +178,70 @@ function TransactionCard({
       className={`flex items-start gap-2 rounded-lg border bg-card px-3 py-2.5 text-sm select-none transition-all duration-200 ${
         isHidden
           ? "opacity-0 h-0 p-0 m-0 border-0 overflow-hidden"
-          : "cursor-grab active:cursor-grabbing hover:shadow-md shadow-sm"
+          : isFrozen
+            ? "cursor-default hover:shadow-sm shadow-sm"
+            : "cursor-grab active:cursor-grabbing hover:shadow-md shadow-sm"
       } ${isSelected && !isHidden ? "bg-primary/5 border-primary shadow-[inset_0_0_0_1px_hsl(var(--primary))]" : ""}`}
       {...attributes}
       {...listeners}
     >
       {/* Payer avatar + Checkbox stacked */}
       <div onPointerDown={(e) => e.stopPropagation()} className="flex flex-col items-center gap-1.5 pt-1">
-        <Popover>
-          <PopoverTrigger
-            render={
-              <button
-                type="button"
-                title={`Payer: ${user?.name || "?"}`}
-                className={`rounded-full ring-2 ring-offset-1 transition-colors hover:ring-offset-2 ${userIndex === 0 ? "ring-primary" : "ring-warm"}`}
-              >
-                <Avatar className="h-4 w-4">
-                  {user?.avatar_url && <AvatarImage src={user.avatar_url} />}
-                  <AvatarFallback className="text-[7px] font-semibold">
-                    {user?.name?.[0]?.toUpperCase() || "?"}
-                  </AvatarFallback>
-                </Avatar>
-              </button>
-            }
-          />
-          <PopoverContent className="w-36 p-1" align="start">
-            <p className="px-2 py-1 text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
-              Payer{bulkLabel}
-            </p>
-            {users.map((u, i) => (
-              <button
-                key={u.id}
-                type="button"
-                onClick={() => onChangeUser(u.id)}
-                className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-accent transition-colors ${
-                  u.id === transaction.user_id ? "bg-accent font-medium" : ""
-                }`}
-              >
-                <Avatar className="h-4 w-4">
-                  {u.avatar_url && <AvatarImage src={u.avatar_url} />}
-                  <AvatarFallback className="text-[7px]">{u.name?.[0]?.toUpperCase()}</AvatarFallback>
-                </Avatar>
-                {u.name}
-              </button>
-            ))}
-          </PopoverContent>
-        </Popover>
+        {isFrozen ? (
+          <button
+            type="button"
+            title="Payer is locked because this transaction is part of a settled batch"
+            className={`rounded-full ring-2 ring-offset-1 opacity-70 ${userIndex === 0 ? "ring-primary" : "ring-warm"}`}
+            onClick={() => onClickDetail(transaction)}
+          >
+            <Avatar className="h-4 w-4">
+              {user?.avatar_url && <AvatarImage src={user.avatar_url} />}
+              <AvatarFallback className="text-[7px] font-semibold">
+                {user?.name?.[0]?.toUpperCase() || "?"}
+              </AvatarFallback>
+            </Avatar>
+          </button>
+        ) : (
+          <Popover>
+            <PopoverTrigger
+              render={
+                <button
+                  type="button"
+                  title={`Payer: ${user?.name || "?"}`}
+                  className={`rounded-full ring-2 ring-offset-1 transition-colors hover:ring-offset-2 ${userIndex === 0 ? "ring-primary" : "ring-warm"}`}
+                >
+                  <Avatar className="h-4 w-4">
+                    {user?.avatar_url && <AvatarImage src={user.avatar_url} />}
+                    <AvatarFallback className="text-[7px] font-semibold">
+                      {user?.name?.[0]?.toUpperCase() || "?"}
+                    </AvatarFallback>
+                  </Avatar>
+                </button>
+              }
+            />
+            <PopoverContent className="w-36 p-1" align="start">
+              <p className="px-2 py-1 text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
+                Payer{bulkLabel}
+              </p>
+              {users.map((u) => (
+                <button
+                  key={u.id}
+                  type="button"
+                  onClick={() => onChangeUser(u.id)}
+                  className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-accent transition-colors ${
+                    u.id === transaction.user_id ? "bg-accent font-medium" : ""
+                  }`}
+                >
+                  <Avatar className="h-4 w-4">
+                    {u.avatar_url && <AvatarImage src={u.avatar_url} />}
+                    <AvatarFallback className="text-[7px]">{u.name?.[0]?.toUpperCase()}</AvatarFallback>
+                  </Avatar>
+                  {u.name}
+                </button>
+              ))}
+            </PopoverContent>
+          </Popover>
+        )}
         <Checkbox
           checked={isSelected}
           onCheckedChange={() => onToggleSelect(transaction.id, false)}
@@ -188,8 +264,10 @@ function TransactionCard({
           >
             {transaction.enriched_name || transaction.description}
           </p>
-          <span className={`text-xs font-mono shrink-0 ${transaction.amount >= 0 ? "text-green-600" : "text-muted-foreground"}`}>
-            {transaction.amount >= 0 ? "+" : ""}{formatCurrency(transaction.amount)}
+          <span
+            className={`shrink-0 text-xs font-mono ${getTransactionAmountClassName(transaction.amount)}`}
+          >
+            {formatSignedCurrency(transaction.amount)}
           </span>
         </div>
 
@@ -199,6 +277,11 @@ function TransactionCard({
             <span className="text-xs text-muted-foreground">
               {format(new Date(transaction.date), "MMM d")}
             </span>
+            {isFrozen && (
+              <Badge variant="outline" className="h-4 px-1 text-[9px]">
+                Settled
+              </Badge>
+            )}
             {transaction.bank_name && (
               <span className="text-[10px] text-muted-foreground/70">
                 · {transaction.bank_name}
@@ -211,52 +294,69 @@ function TransactionCard({
 
           {/* Category badge */}
           <div onPointerDown={(e) => e.stopPropagation()}>
-            <Popover>
-              <PopoverTrigger
-                render={
-                  <button
-                    type="button"
-                    title="Change category"
-                    className="inline-flex items-center gap-1 rounded-full border px-1.5 py-0 h-[18px] text-[10px] font-medium transition-colors hover:bg-accent text-muted-foreground"
-                  >
-                    {displayCategory?.color && (
-                      <span
-                        className="inline-block h-1.5 w-1.5 rounded-full shrink-0"
-                        style={{ backgroundColor: displayCategory.color }}
-                      />
-                    )}
-                    {displayCategory?.display_name?.replace(/^[^\w\s]*\s*/, "").split(" ")[0] || "Uncategorized"}
-                  </button>
-                }
-              />
-              <PopoverContent className="w-44 p-1" align="end">
-                <p className="px-2 py-1 text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
-                  Category{bulkLabel}
-                </p>
-                <ScrollArea className="max-h-48">
-                  {categories
-                    .filter((c) => c.name !== "deleted")
-                    .map((c) => (
-                      <button
-                        key={c.id}
-                        type="button"
-                        onClick={() => onChangeCategory(c.id)}
-                        className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-accent transition-colors ${
-                          c.id === transaction.category_id ? "bg-accent font-medium" : ""
-                        }`}
-                      >
-                        {c.color && (
-                          <span
-                            className="inline-block h-2 w-2 rounded-full shrink-0"
-                            style={{ backgroundColor: c.color }}
-                          />
-                        )}
-                        <span className="truncate">{c.display_name}</span>
-                      </button>
-                    ))}
-                </ScrollArea>
-              </PopoverContent>
-            </Popover>
+            {isFrozen ? (
+              <button
+                type="button"
+                title="Category is locked because this transaction is part of a settled batch"
+                className="inline-flex items-center gap-1 rounded-full border px-1.5 py-0 h-[18px] text-[10px] font-medium text-muted-foreground opacity-70"
+                onClick={() => onClickDetail(transaction)}
+              >
+                {displayCategory?.color && (
+                  <span
+                    className="inline-block h-1.5 w-1.5 rounded-full shrink-0"
+                    style={{ backgroundColor: displayCategory.color }}
+                  />
+                )}
+                {displayCategory?.display_name?.replace(/^[^\w\s]*\s*/, "").split(" ")[0] || "Uncategorized"}
+              </button>
+            ) : (
+              <Popover>
+                <PopoverTrigger
+                  render={
+                    <button
+                      type="button"
+                      title="Change category"
+                      className="inline-flex items-center gap-1 rounded-full border px-1.5 py-0 h-[18px] text-[10px] font-medium transition-colors hover:bg-accent text-muted-foreground"
+                    >
+                      {displayCategory?.color && (
+                        <span
+                          className="inline-block h-1.5 w-1.5 rounded-full shrink-0"
+                          style={{ backgroundColor: displayCategory.color }}
+                        />
+                      )}
+                      {displayCategory?.display_name?.replace(/^[^\w\s]*\s*/, "").split(" ")[0] || "Uncategorized"}
+                    </button>
+                  }
+                />
+                <PopoverContent className="w-44 p-1" align="end">
+                  <p className="px-2 py-1 text-[10px] font-medium text-muted-foreground uppercase tracking-wider">
+                    Category{bulkLabel}
+                  </p>
+                  <ScrollArea className="max-h-48">
+                    {categories
+                      .filter((c) => c.name !== "deleted")
+                      .map((c) => (
+                        <button
+                          key={c.id}
+                          type="button"
+                          onClick={() => onChangeCategory(c.id)}
+                          className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-accent transition-colors ${
+                            c.id === transaction.category_id ? "bg-accent font-medium" : ""
+                          }`}
+                        >
+                          {c.color && (
+                            <span
+                              className="inline-block h-2 w-2 rounded-full shrink-0"
+                              style={{ backgroundColor: c.color }}
+                            />
+                          )}
+                          <span className="truncate">{c.display_name}</span>
+                        </button>
+                      ))}
+                  </ScrollArea>
+                </PopoverContent>
+              </Popover>
+            )}
           </div>
         </div>
       </div>
@@ -294,8 +394,10 @@ function TransactionCardOverlay({
             <p className="text-xs text-muted-foreground">
               {format(new Date(transaction.date), "MMM d")}
             </p>
-            <span className="text-xs font-mono text-muted-foreground">
-              {formatCurrency(transaction.amount)}
+            <span
+              className={`text-xs font-mono ${getTransactionAmountClassName(transaction.amount)}`}
+            >
+              {formatSignedCurrency(transaction.amount)}
             </span>
             {user && (
               <Badge variant="outline" className={`text-[10px] px-1 py-0 h-4 ${userColor}`}>
@@ -324,6 +426,7 @@ function CategoryColumn({
   categories,
   transactions,
   users,
+  settledTransactionIds,
   selectedIds,
   activeId,
   activeDragIds,
@@ -340,6 +443,7 @@ function CategoryColumn({
   categories: Category[];
   transactions: Transaction[];
   users: User[];
+  settledTransactionIds: Set<string>;
   selectedIds: Set<string>;
   activeId: string | null;
   activeDragIds: Set<string>;
@@ -438,6 +542,7 @@ function CategoryColumn({
               transaction={t}
               categories={categories}
               users={users}
+              isFrozen={settledTransactionIds.has(t.id)}
               isSelected={selectedIds.has(t.id)}
               isMultiDragSource={activeId !== null && activeId !== t.id && activeDragIds.has(t.id)}
               selectedCount={selectedIds.has(t.id) ? selectedIds.size : 1}
@@ -462,292 +567,6 @@ function CategoryColumn({
         </div>
       </ScrollArea>
     </div>
-  );
-}
-
-// ─── Detail Components ───────────────────────────────────────────────────────
-
-function DetailRow({ label, value }: { label: string; value: React.ReactNode }) {
-  if (!value) return null;
-  return (
-    <div className="grid grid-cols-[120px_1fr] gap-2 text-sm">
-      <span className="text-muted-foreground">{label}</span>
-      <span className="break-words">{value}</span>
-    </div>
-  );
-}
-
-function TransactionDetailDialog({
-  transaction,
-  categories,
-  users,
-  enriching,
-  onClose,
-  onEnrich,
-  onUpdate,
-  onDelete,
-}: {
-  transaction: Transaction | null;
-  categories: Category[];
-  users: User[];
-  enriching: boolean;
-  onClose: () => void;
-  onEnrich: (t: Transaction) => void;
-  onUpdate: (t: Transaction) => void;
-  onDelete: (t: Transaction) => void;
-}) {
-  const [notes, setNotes] = useState("");
-  const [savingNotes, setSavingNotes] = useState(false);
-  const [selectedCategoryId, setSelectedCategoryId] = useState<string>("");
-
-  useEffect(() => {
-    if (transaction) {
-      setNotes(transaction.notes || "");
-      setSelectedCategoryId(transaction.category_id || "");
-    }
-  }, [transaction]);
-
-  if (!transaction) return null;
-
-  const user = users.find((u) => u.id === transaction.user_id);
-  const userIndex = users.findIndex((u) => u.id === transaction.user_id);
-  const userColor = userIndex === 0 ? "border-primary text-primary" : "border-warm text-warm";
-
-  const notesChanged = notes.trim() !== (transaction?.notes || "").trim();
-
-  async function handleSaveNotes() {
-    if (!transaction || savingNotes) return;
-    const trimmed = notes.trim();
-    const original = (transaction.notes || "").trim();
-    if (trimmed === original) return;
-    setSavingNotes(true);
-    try {
-      // Notes is an encrypted field — re-encrypt the full transaction with updated notes
-      const updated = { ...transaction, notes: trimmed || null };
-      const encrypted_data = await encryptTransaction(updated as unknown as Record<string, unknown>);
-      const res = await fetch(`/api/transactions/${transaction.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ encrypted_data }),
-      });
-      if (res.ok) {
-        onUpdate(updated);
-        toast.success("Note saved");
-      } else {
-        toast.error("Failed to save note");
-      }
-    } catch {
-      toast.error("Failed to save note");
-    } finally {
-      setSavingNotes(false);
-    }
-  }
-
-  async function handleCategoryChange(catId: string) {
-    if (!transaction) return;
-    setSelectedCategoryId(catId);
-    try {
-      const res = await fetch(`/api/transactions/${transaction.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ category_id: catId || null }),
-      });
-      if (res.ok) {
-        const serverData = await res.json();
-        onUpdate({ ...transaction, ...serverData });
-        toast.success("Category updated");
-      }
-    } catch {
-      toast.error("Failed to update category");
-    }
-  }
-
-  return (
-    <Dialog open={!!transaction} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-w-lg max-h-[85vh] overflow-y-auto">
-        <DialogHeader>
-          <DialogTitle className="text-lg pr-6">
-            {transaction.enriched_name || transaction.description}
-          </DialogTitle>
-          {transaction.enriched_name && transaction.enriched_name !== transaction.description && (
-            <DialogDescription className="font-mono text-xs">
-              {transaction.description}
-            </DialogDescription>
-          )}
-        </DialogHeader>
-
-        <div className="space-y-4">
-          {/* Amount + Date */}
-          <div className="flex items-center justify-between rounded-lg bg-muted/50 p-4">
-            <div>
-              <p className="text-2xl font-bold font-mono">
-                {formatCurrency(transaction.amount)}
-              </p>
-              <p className="text-sm text-muted-foreground">
-                {format(new Date(transaction.date), "EEEE, MMMM d, yyyy")}
-              </p>
-            </div>
-            {transaction.transaction_type && (
-              <Badge variant="secondary">{transaction.transaction_type}</Badge>
-            )}
-          </div>
-
-          {/* Enrichment section */}
-          {transaction.enriched_at ? (
-            <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 space-y-2 dark:border-amber-900 dark:bg-amber-950/30">
-              <div className="flex items-center gap-2 text-sm font-medium text-amber-700 dark:text-amber-400">
-                <Sparkles className="h-4 w-4" />
-                AI Enriched
-              </div>
-              <div className="space-y-1">
-                <DetailRow label="Merchant" value={transaction.enriched_name} />
-                <DetailRow label="Type" value={transaction.enriched_info} />
-                {transaction.enriched_description && (
-                  <div className="py-1">
-                    <p className="text-xs font-medium text-muted-foreground">About</p>
-                    <p className="text-sm">{transaction.enriched_description}</p>
-                  </div>
-                )}
-                <DetailRow label="Address" value={transaction.enriched_address} />
-              </div>
-              <p className="text-xs text-muted-foreground">
-                Enriched {format(new Date(transaction.enriched_at), "MMM d, yyyy HH:mm")}
-              </p>
-            </div>
-          ) : (
-            <Button
-              variant="outline"
-              className="w-full"
-              onClick={() => onEnrich(transaction)}
-              disabled={enriching}
-            >
-              {enriching ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Enriching with AI...
-                </>
-              ) : (
-                <>
-                  <Sparkles className="mr-2 h-4 w-4" />
-                  Enrich with AI
-                </>
-              )}
-            </Button>
-          )}
-
-          <Separator />
-
-          {/* Details */}
-          <div className="space-y-2">
-            <DetailRow label="User" value={user?.name} />
-            <DetailRow
-              label="Category"
-              value={
-                <select
-                  value={selectedCategoryId}
-                  onChange={(e) => handleCategoryChange(e.target.value)}
-                  className="h-8 rounded-md border border-input bg-background px-2 text-sm"
-                >
-                  <option value="">Uncategorized</option>
-                  {categories.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.display_name}
-                    </option>
-                  ))}
-                </select>
-              }
-            />
-            <DetailRow label="Subcategory" value={transaction.subcategory} />
-            <DetailRow
-              label="Tags"
-              value={
-                transaction.tags && transaction.tags.length > 0 ? (
-                  <div className="flex flex-wrap gap-1">
-                    {transaction.tags.map((tag, i) => (
-                      <Badge key={i} variant="outline" className="text-xs">
-                        {tag}
-                      </Badge>
-                    ))}
-                  </div>
-                ) : null
-              }
-            />
-          </div>
-
-          {/* Bank info */}
-          {(transaction.bank_name || transaction.account_number || transaction.account_name) && (
-            <>
-              <Separator />
-              <div className="space-y-2">
-                <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-                  Bank Details
-                </p>
-                <DetailRow label="Bank" value={transaction.bank_name} />
-                <DetailRow label="Account" value={transaction.account_name} />
-                <DetailRow label="Account #" value={transaction.account_number} />
-              </div>
-            </>
-          )}
-
-          {/* Notes */}
-          <Separator />
-          <div className="space-y-2">
-            <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-              Notes
-            </p>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={notes}
-                onChange={(e) => setNotes(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    handleSaveNotes();
-                  }
-                }}
-                className="flex-1 rounded-md border border-input bg-background px-3 py-1.5 text-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                placeholder="Add a note..."
-                disabled={savingNotes}
-              />
-              {notesChanged && (
-                <Button
-                  size="sm"
-                  onClick={handleSaveNotes}
-                  disabled={savingNotes}
-                  className="shrink-0"
-                >
-                  {savingNotes ? "Saving..." : "Save"}
-                </Button>
-              )}
-            </div>
-          </div>
-
-          {/* Metadata */}
-          <Separator />
-          <div className="flex items-center justify-between">
-            <div className="text-xs text-muted-foreground space-y-1">
-              <p>Created: {format(new Date(transaction.created_at), "MMM d, yyyy HH:mm")}</p>
-              {transaction.updated_at !== transaction.created_at && (
-                <p>Updated: {format(new Date(transaction.updated_at), "MMM d, yyyy HH:mm")}</p>
-              )}
-              <p className="font-mono text-[10px] opacity-50">ID: {transaction.id}</p>
-            </div>
-            {/* Delete button — disabled for now, soft-delete via category
-            <Button
-              variant="ghost"
-              size="sm"
-              className="text-destructive hover:text-destructive hover:bg-destructive/10"
-              onClick={() => onDelete(transaction)}
-            >
-              <Trash2 className="h-3.5 w-3.5 mr-1.5" />
-              Delete
-            </Button>
-            */}
-          </div>
-        </div>
-      </DialogContent>
-    </Dialog>
   );
 }
 
@@ -865,13 +684,16 @@ function autoCategorizeTransaction(
 // ─── Main Page ───────────────────────────────────────────────────────────────
 
 export default function TransactionsPage() {
+  const data = useData();
   const [currentMonth, setCurrentMonth] = useState<Date | null>(null);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
-  const [categories, setCategories] = useState<Category[]>([]);
-  const [users, setUsers] = useState<User[]>([]);
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [merchantRules, setMerchantRules] = useState<MerchantRule[]>([]);
-  const [loading, setLoading] = useState(true);
+  // Local aliases from central cache
+  const categories = data.categories;
+  const users = data.users;
+  const currentUser = data.currentUser;
+  const merchantRules = data.merchantRules;
+  const settledTransactionIds = getSettledTransactionIds(data.settlements);
+  const loading = data.loading && data.lastFetched === 0;
   const [userFilter, setUserFilter] = useState<string>("all");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -880,92 +702,59 @@ export default function TransactionsPage() {
   const [enriching, setEnriching] = useState(false);
   const [autoSorting, setAutoSorting] = useState(false);
   const [columnOrder, setColumnOrder] = useState<string[]>([]);
-  const [draggingColumnId, setDraggingColumnId] = useState<string | null>(null);
   const draggingColumnIdRef = useRef<string | null>(null);
   const lastSelectedRef = useRef<string | null>(null);
-  const fetchDecrypted = useDecryptedFetch();
-
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } })
   );
 
-  const fetchData = useCallback(async () => {
-    setLoading(true);
-
-    try {
-      const [txData, catRes, usersRes, userRes, rulesRes] = await Promise.all([
-        fetchDecrypted("/api/transactions"),
-        fetch("/api/categories"),
-        fetch("/api/users"),
-        fetch("/api/user"),
-        fetch("/api/merchant-rules"),
-      ]);
-
-      const dek = getDEK();
-      const allTx = txData as Transaction[];
-
-      // On first load (no month selected yet), auto-detect from the most recent transaction date
-      let activeMonth = currentMonth;
-      if (!activeMonth && allTx.length > 0) {
-        let latest: Date | null = null;
-        for (const t of allTx) {
-          if (!t.date) continue;
-          try {
-            const d = parseISO(t.date);
-            if (!latest || d > latest) latest = d;
-          } catch { /* skip */ }
-        }
-        activeMonth = startOfMonth(latest ?? new Date());
-        setCurrentMonth(activeMonth);
-      }
-      if (!activeMonth) {
-        activeMonth = startOfMonth(new Date());
-        setCurrentMonth(activeMonth);
-      }
-
-      const monthStart = startOfMonth(activeMonth);
-      const monthEnd = endOfMonth(activeMonth);
-      const filterByMonth = (t: Transaction) => {
-        if (!t.date) return false;
-        try {
-          return isWithinInterval(parseISO(t.date), { start: monthStart, end: monthEnd });
-        } catch {
-          return false;
-        }
-      };
-
-      if (catRes.ok) {
-        const rawCats = await catRes.json();
-        const cats = await decryptEntities(rawCats, dek) as unknown as Category[];
-        setCategories(cats);
-        const deletedCatId = cats.find((c: Category) => c.name === "deleted")?.id;
-        const monthFiltered = allTx.filter(filterByMonth);
-        setTransactions(deletedCatId ? monthFiltered.filter((t) => t.category_id !== deletedCatId) : monthFiltered);
-      } else {
-        setTransactions(allTx.filter(filterByMonth));
-      }
-      if (usersRes.ok) {
-        const rawUsers = await usersRes.json();
-        setUsers(await decryptEntities(rawUsers, dek) as unknown as User[]);
-      }
-      if (userRes.ok) {
-        const rawUser = await userRes.json();
-        setCurrentUser(await decryptEntity(rawUser, dek) as unknown as User);
-      }
-      if (rulesRes.ok) {
-        const rawRules = await rulesRes.json();
-        setMerchantRules(await decryptEntities(rawRules, dek) as unknown as MerchantRule[]);
-      }
-    } catch {
-      // silent
-    } finally {
-      setLoading(false);
-    }
-  }, [currentMonth, fetchDecrypted]);
-
+  // Filter transactions by month from the central cache
   useEffect(() => {
-    fetchData();
-  }, [fetchData]);
+    const allTx = data.transactions;
+    if (allTx.length === 0 && data.loading) return;
+
+    // Auto-detect month from most recent transaction on first load
+    let activeMonth = currentMonth;
+    if (!activeMonth && allTx.length > 0) {
+      let latest: Date | null = null;
+      for (const t of allTx) {
+        if (!t.date) continue;
+        try {
+          const d = parseISO(t.date);
+          if (!latest || d > latest) latest = d;
+        } catch { /* skip */ }
+      }
+      activeMonth = startOfMonth(latest ?? new Date());
+      setCurrentMonth(activeMonth);
+      return; // Will re-run with activeMonth set
+    }
+    if (!activeMonth) {
+      activeMonth = startOfMonth(new Date());
+      setCurrentMonth(activeMonth);
+      return;
+    }
+
+    const monthStart = startOfMonth(activeMonth);
+    const monthEnd = endOfMonth(activeMonth);
+    const deletedCatId = categories.find((c) => c.name === "deleted")?.id;
+
+    const filtered = allTx.filter((t) => {
+      if (!t.date) return false;
+      if (deletedCatId && t.category_id === deletedCatId) return false;
+      try {
+        return isWithinInterval(parseISO(t.date), { start: monthStart, end: monthEnd });
+      } catch {
+        return false;
+      }
+    });
+
+    setTransactions(filtered);
+  }, [data.transactions, data.loading, currentMonth, categories]);
+
+  // Re-fetch after drag-and-drop changes
+  const fetchData = useCallback(async () => {
+    await data.refreshTransactions();
+  }, [data]);
 
   // Compute smart column order when categories or current user changes
   // Per-user column order is stored in localStorage
@@ -1065,7 +854,6 @@ export default function TransactionsPage() {
     // Check if this is a column drag
     if (id.startsWith("col:")) {
       const colId = id.replace("col:", "");
-      setDraggingColumnId(colId);
       draggingColumnIdRef.current = colId;
       return;
     }
@@ -1095,7 +883,6 @@ export default function TransactionsPage() {
 
     // Handle column reorder
     if (activeIdStr.startsWith("col:")) {
-      setDraggingColumnId(null);
       draggingColumnIdRef.current = null;
 
       if (!over) return;
@@ -1144,8 +931,19 @@ export default function TransactionsPage() {
     const idsToMove = selectedIds.has(draggedId)
       ? Array.from(selectedIds)
       : [draggedId];
+    const { mutableIds, frozenCount } = splitMutableTransactionIds(
+      idsToMove,
+      settledTransactionIds
+    );
 
-    const hasCategoryChange = idsToMove.some((id) => {
+    if (mutableIds.length === 0) {
+      toastSettledTransactionsLocked();
+      return;
+    }
+
+    toastSkippedFrozenTransactions(frozenCount);
+
+    const hasCategoryChange = mutableIds.some((id) => {
       const transaction = transactions.find((t) => t.id === id);
       const sourceCategoryId = transaction?.category_id || uncategorizedCat?.id;
       return sourceCategoryId !== targetCategoryId;
@@ -1161,7 +959,7 @@ export default function TransactionsPage() {
 
     setTransactions((prev) =>
       prev.map((t) =>
-        idsToMove.includes(t.id)
+        mutableIds.includes(t.id)
           ? { ...t, category_id: resolvedTargetId }
           : t
       )
@@ -1174,7 +972,7 @@ export default function TransactionsPage() {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          transactionIds: idsToMove,
+          transactionIds: mutableIds,
           category_id: resolvedTargetId,
         }),
       });
@@ -1185,16 +983,24 @@ export default function TransactionsPage() {
         return;
       }
 
-      toast.success(`Moved ${idsToMove.length} transaction(s)`);
+      toast.success(`Moved ${mutableIds.length} transaction(s)`);
 
-      // Auto-create/update merchant rules (skip for Exclude/Deleted/Uncategorized)
+      // Auto-create/update merchant rules (skip for Deleted/Uncategorized, but include Exclude)
       const targetCat = categories.find((c) => c.id === resolvedTargetId);
-      const skipAutoLearn = !resolvedTargetId || targetCat?.split_type === "none";
+      const isExclude = targetCat?.name === "exclude";
+      const isDeleted = targetCat?.name === "deleted";
+      const skipAutoLearn = !resolvedTargetId || (isDeleted || (!isExclude && targetCat?.split_type === "none"));
 
       if (!skipAutoLearn) {
-        const movedTxs = transactions.filter((t) => idsToMove.includes(t.id));
+        // Use the pre-optimistic-update transactions to get descriptions
+        // (closured `transactions` still has the old state before setTransactions)
+        const movedTxs = transactions.filter((t) => mutableIds.includes(t.id));
         const uniqueDescriptions = [
-          ...new Set(movedTxs.map((t) => t.description.toLowerCase().trim()).filter(Boolean)),
+          ...new Set(
+            movedTxs
+              .map((t) => t.description?.toLowerCase().trim())
+              .filter((d): d is string => !!d && d !== "[encrypted]" && d !== "[decryption failed]")
+          ),
         ];
 
         // Batch: separate new vs existing rules
@@ -1256,13 +1062,8 @@ export default function TransactionsPage() {
 
         if (rulePromises.length > 0) {
           await Promise.all(rulePromises);
-          // Refresh rules with decryption
-          const dek = getDEK();
-          const rulesRes = await fetch("/api/merchant-rules");
-          if (rulesRes.ok) {
-            const raw = await rulesRes.json();
-            setMerchantRules(await decryptEntities(raw, dek) as unknown as MerchantRule[]);
-          }
+          // Refresh rules via cache
+          await data.refreshMerchantRules();
         }
       }
     } catch {
@@ -1280,8 +1081,16 @@ export default function TransactionsPage() {
     setAutoSorting(true);
 
     const uncategorizedTxs = filteredTransactions.filter(
-      (t) => !t.category_id || t.category_id === uncategorizedCat.id
+      (t) =>
+        (!t.category_id || t.category_id === uncategorizedCat.id) &&
+        !settledTransactionIds.has(t.id)
     );
+
+    if (uncategorizedTxs.length === 0) {
+      toast.info("No editable uncategorized transactions to auto-sort");
+      setAutoSorting(false);
+      return;
+    }
 
     // Match each uncategorized transaction against rules
     const matches: { transactionId: string; categoryId: string }[] = [];
@@ -1387,51 +1196,28 @@ export default function TransactionsPage() {
     );
   }
 
-  async function handleDeleteTransaction(transaction: Transaction) {
-    const deletedCategory = categories.find((c) => c.name === "deleted");
-    if (!deletedCategory) {
-      toast.error("Deleted category not found");
+  async function handleCardChangeUser(transactionId: string, userId: string) {
+    const ids = selectedIds.has(transactionId) ? Array.from(selectedIds) : [transactionId];
+    const { mutableIds, frozenCount } = splitMutableTransactionIds(
+      ids,
+      settledTransactionIds
+    );
+
+    if (mutableIds.length === 0) {
+      toastSettledTransactionsLocked();
       return;
     }
 
-    try {
-      const res = await fetch(`/api/transactions/${transaction.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ category_id: deletedCategory.id }),
-      });
-
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        console.error("[handleDeleteTransaction]", data);
-        toast.error(data.error || "Failed to delete transaction");
-        return;
-      }
-
-      setTransactions((prev) => prev.filter((t) => t.id !== transaction.id));
-      setDetailTransaction(null);
-      toast.success("Transaction moved to Deleted", {
-        action: {
-          label: "Restore in Settings",
-          onClick: () => window.location.assign("/dashboard/settings"),
-        },
-      });
-    } catch {
-      toast.error("Failed to delete transaction");
-    }
-  }
-
-  async function handleCardChangeUser(transactionId: string, userId: string) {
-    const ids = selectedIds.has(transactionId) ? Array.from(selectedIds) : [transactionId];
+    toastSkippedFrozenTransactions(frozenCount);
 
     // Optimistic update
     setTransactions((prev) =>
-      prev.map((t) => (ids.includes(t.id) ? { ...t, user_id: userId } : t))
+      prev.map((t) => (mutableIds.includes(t.id) ? { ...t, user_id: userId } : t))
     );
 
     try {
       await Promise.all(
-        ids.map((id) =>
+        mutableIds.map((id) =>
           fetch(`/api/transactions/${id}`, {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
@@ -1440,7 +1226,7 @@ export default function TransactionsPage() {
         )
       );
       const userName = users.find((u) => u.id === userId)?.name || "user";
-      toast.success(`Updated payer to ${userName} for ${ids.length} transaction(s)`);
+      toast.success(`Updated payer to ${userName} for ${mutableIds.length} transaction(s)`);
     } catch {
       toast.error("Failed to update payer");
       fetchData();
@@ -1449,10 +1235,21 @@ export default function TransactionsPage() {
 
   async function handleCardChangeCategory(transactionId: string, categoryId: string | null) {
     const ids = selectedIds.has(transactionId) ? Array.from(selectedIds) : [transactionId];
+    const { mutableIds, frozenCount } = splitMutableTransactionIds(
+      ids,
+      settledTransactionIds
+    );
+
+    if (mutableIds.length === 0) {
+      toastSettledTransactionsLocked();
+      return;
+    }
+
+    toastSkippedFrozenTransactions(frozenCount);
 
     // Optimistic update
     setTransactions((prev) =>
-      prev.map((t) => (ids.includes(t.id) ? { ...t, category_id: categoryId } : t))
+      prev.map((t) => (mutableIds.includes(t.id) ? { ...t, category_id: categoryId } : t))
     );
     setSelectedIds(new Set());
 
@@ -1460,14 +1257,14 @@ export default function TransactionsPage() {
       const res = await fetch("/api/transactions/bulk", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transactionIds: ids, category_id: categoryId }),
+        body: JSON.stringify({ transactionIds: mutableIds, category_id: categoryId }),
       });
       if (!res.ok) {
         toast.error("Failed to update category");
         fetchData();
         return;
       }
-      toast.success(`Updated category for ${ids.length} transaction(s)`);
+      toast.success(`Updated category for ${mutableIds.length} transaction(s)`);
     } catch {
       toast.error("Failed to update category");
       fetchData();
@@ -1537,7 +1334,6 @@ export default function TransactionsPage() {
           onDragOver={handleDragOver}
           onDragEnd={handleDragEnd}
           onDragCancel={() => {
-            setDraggingColumnId(null);
             draggingColumnIdRef.current = null;
             setActiveId(null);
             setOverColumnId(null);
@@ -1555,6 +1351,7 @@ export default function TransactionsPage() {
                   categories={categories}
                   transactions={getColumnTransactions(col.id)}
                   users={users}
+                  settledTransactionIds={settledTransactionIds}
                   selectedIds={selectedIds}
                   activeId={activeId}
                   activeDragIds={activeDragIds}
@@ -1594,11 +1391,11 @@ export default function TransactionsPage() {
         transaction={detailTransaction}
         categories={categories}
         users={users}
+        isFrozen={!!detailTransaction && settledTransactionIds.has(detailTransaction.id)}
         enriching={enriching}
         onClose={() => setDetailTransaction(null)}
         onEnrich={handleEnrich}
         onUpdate={handleUpdateTransaction}
-        onDelete={handleDeleteTransaction}
       />
     </div>
   );

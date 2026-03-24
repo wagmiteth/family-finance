@@ -79,6 +79,46 @@ export interface MerchantRule {
   created_at: string;
 }
 
+export interface SettlementTransactionSnapshot {
+  id: string;
+  user_id: string | null;
+  category_id: string | null;
+  description: string;
+  enriched_name: string | null;
+  amount: number;
+  date: string;
+  created_at: string;
+}
+
+export interface SettlementUserSummary {
+  userId: string;
+  paid: number;
+  owes: number;
+  net: number;
+}
+
+export interface SettlementCategorySummary {
+  categoryId: string;
+  categoryName: string;
+  splitType: "equal" | "full_payer";
+  total: number;
+  transactionCount: number;
+  paidByUser: Record<string, number>;
+  owesByUser: Record<string, number>;
+}
+
+export interface SettlementBatch {
+  id: string;
+  settled_at: string;
+  amount: number;
+  shared_total: number | null;
+  from_user_id: string | null;
+  to_user_id: string | null;
+  users: SettlementUserSummary[];
+  categories: SettlementCategorySummary[];
+  transactions: SettlementTransactionSnapshot[];
+}
+
 export interface Settlement {
   id: string;
   household_id: string;
@@ -93,6 +133,10 @@ export interface Settlement {
   settled_amount: number | null; // encrypted
   settled_from_user_id: string | null; // encrypted
   settled_to_user_id: string | null; // encrypted
+  settled_users: SettlementUserSummary[] | null; // encrypted
+  settled_categories: SettlementCategorySummary[] | null; // encrypted
+  settled_transactions: SettlementTransactionSnapshot[] | null; // encrypted
+  settlement_batches: SettlementBatch[] | null; // encrypted
   notes: string | null; // encrypted
   created_at: string;
 }

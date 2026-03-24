@@ -69,6 +69,10 @@ const SETTLEMENT_ENCRYPTED_FIELDS = [
   "settled_amount",
   "settled_from_user_id",
   "settled_to_user_id",
+  "settled_users",
+  "settled_categories",
+  "settled_transactions",
+  "settlement_batches",
 ] as const;
 
 // --- Generic encrypt/decrypt ---

@@ -1,11 +1,14 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useState, useMemo } from "react";
 import {
   format,
   startOfMonth,
+  endOfMonth,
   addMonths,
   subMonths,
+  parseISO,
+  isWithinInterval,
 } from "date-fns";
 import {
   Card,
@@ -26,9 +29,7 @@ import {
   Cell,
 } from "recharts";
 import type { Transaction, Category, User, Household } from "@/lib/types";
-import { useDecryptedFetch } from "@/lib/crypto/use-decrypted-fetch";
-import { decryptEntity, decryptEntities } from "@/lib/crypto/entity-crypto";
-import { getDEK } from "@/lib/crypto/key-store";
+import { useData } from "@/lib/crypto/data-provider";
 import { InviteBanner } from "@/components/invite-banner";
 
 function formatCurrency(amount: number) {
@@ -61,50 +62,25 @@ const CHART_COLORS = [
 
 export default function DashboardPage() {
   const [currentMonth, setCurrentMonth] = useState(startOfMonth(new Date()));
-  const [transactions, setTransactions] = useState<Transaction[]>([]);
-  const [categories, setCategories] = useState<Category[]>([]);
-  const [users, setUsers] = useState<User[]>([]);
-  const [household, setHousehold] = useState<Household | null>(null);
-  const [loading, setLoading] = useState(true);
-  const fetchDecrypted = useDecryptedFetch();
+  const data = useData();
+  const categories = data.categories;
+  const users = data.users;
+  const household = data.household;
+  const loading = data.loading && data.lastFetched === 0;
 
-  const fetchData = useCallback(async () => {
-    setLoading(true);
-    const month = format(currentMonth, "yyyy-MM");
-
-    try {
-      const [txData, catRes, usersRes, householdRes] = await Promise.all([
-        fetchDecrypted(`/api/transactions?month=${month}`),
-        fetch("/api/categories"),
-        fetch("/api/users"),
-        fetch("/api/household"),
-      ]);
-
-      const dek = getDEK();
-      setTransactions(txData as Transaction[]);
-      if (catRes.ok) {
-        const rawCats = await catRes.json();
-        setCategories(await decryptEntities(rawCats, dek) as unknown as Category[]);
+  // Filter transactions by selected month from the cache
+  const transactions = useMemo(() => {
+    const monthStart = startOfMonth(currentMonth);
+    const monthEnd = endOfMonth(currentMonth);
+    return data.transactions.filter((t) => {
+      if (!t.date) return false;
+      try {
+        return isWithinInterval(parseISO(t.date), { start: monthStart, end: monthEnd });
+      } catch {
+        return false;
       }
-      if (usersRes.ok) {
-        const rawUsers = await usersRes.json();
-        setUsers(await decryptEntities(rawUsers, dek) as unknown as User[]);
-      }
-      if (householdRes.ok) {
-        const data = await householdRes.json();
-        const decryptedHousehold = await decryptEntity(data.household, dek);
-        setHousehold(decryptedHousehold as unknown as Household);
-      }
-    } catch {
-      // silent
-    } finally {
-      setLoading(false);
-    }
-  }, [currentMonth, fetchDecrypted]);
-
-  useEffect(() => {
-    fetchData();
-  }, [fetchData]);
+    });
+  }, [data.transactions, currentMonth]);
 
   const categoryById = new Map(categories.map((c) => [c.id, c]));
   const sharedCategoryIds = new Set(

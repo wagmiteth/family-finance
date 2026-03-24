@@ -2,6 +2,7 @@ import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { DashboardShell } from "./dashboard-shell";
 import { EncryptionGate } from "./encryption-gate";
+import { DataProvider } from "@/lib/crypto/data-provider";
 
 export default async function DashboardLayout({
   children,
@@ -39,7 +40,9 @@ export default async function DashboardLayout({
       householdEncryptedData={household?.encrypted_data || null}
     >
       <EncryptionGate>
-        {children}
+        <DataProvider>
+          {children}
+        </DataProvider>
       </EncryptionGate>
     </DashboardShell>
   );
