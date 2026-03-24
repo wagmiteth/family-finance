@@ -1,0 +1,170 @@
+"use client";
+
+import { usePathname } from "next/navigation";
+import Link from "next/link";
+import type { User } from "@/lib/types";
+import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+  SheetTrigger,
+} from "@/components/ui/sheet";
+import {
+  LayoutDashboard,
+  ArrowLeftRight,
+  Upload,
+  Calculator,
+  Settings,
+  Menu,
+} from "lucide-react";
+import { useState } from "react";
+
+const navItems = [
+  { href: "/dashboard", label: "Overview", icon: LayoutDashboard },
+  { href: "/dashboard/transactions", label: "Transactions", icon: ArrowLeftRight },
+  { href: "/dashboard/upload", label: "Upload", icon: Upload },
+  { href: "/dashboard/settlements", label: "Settlements", icon: Calculator },
+  { href: "/dashboard/settings", label: "Settings", icon: Settings },
+];
+
+function NavLinks({
+  pathname,
+  onNavigate,
+  direction = "horizontal",
+}: {
+  pathname: string;
+  onNavigate?: () => void;
+  direction?: "horizontal" | "vertical";
+}) {
+  return (
+    <nav
+      className={cn(
+        "flex gap-0.5",
+        direction === "vertical" ? "flex-col" : "flex-row items-center"
+      )}
+    >
+      {navItems.map((item) => {
+        const isActive =
+          item.href === "/dashboard"
+            ? pathname === "/dashboard"
+            : pathname.startsWith(item.href);
+        return (
+          <Link
+            key={item.href}
+            href={item.href}
+            onClick={onNavigate}
+            className={cn(
+              "flex items-center gap-2 rounded-md px-3 py-2 text-[13px] font-medium transition-colors",
+              direction === "vertical" && "w-full",
+              isActive
+                ? "bg-accent text-foreground"
+                : "text-muted-foreground hover:text-foreground hover:bg-accent/50"
+            )}
+          >
+            <item.icon className="h-4 w-4" strokeWidth={1.5} />
+            {item.label}
+          </Link>
+        );
+      })}
+    </nav>
+  );
+}
+
+export function DashboardShell({
+  user,
+  householdName,
+  children,
+}: {
+  user: User;
+  householdName: string;
+  children: React.ReactNode;
+}) {
+  const pathname = usePathname();
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const initials = (user.name || user.email)
+    .split(" ")
+    .map((s) => s[0])
+    .join("")
+    .toUpperCase()
+    .slice(0, 2);
+
+  return (
+    <div className="flex min-h-screen flex-col">
+      {/* Top navigation bar */}
+      <header className="sticky top-0 z-30 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
+        <div className="flex h-14 items-center gap-4 px-4 md:px-6">
+          {/* Mobile hamburger */}
+          <Sheet open={mobileOpen} onOpenChange={setMobileOpen}>
+            <SheetTrigger
+              render={
+                <Button variant="ghost" size="icon" className="shrink-0 md:hidden">
+                  <Menu className="h-5 w-5" />
+                  <span className="sr-only">Menu</span>
+                </Button>
+              }
+            />
+            <SheetContent side="left" className="w-[260px] p-0">
+              <SheetHeader className="border-b px-5 py-4">
+                <SheetTitle className="text-sm">{householdName}</SheetTitle>
+              </SheetHeader>
+              <div className="p-3">
+                <NavLinks
+                  pathname={pathname}
+                  direction="vertical"
+                  onNavigate={() => setMobileOpen(false)}
+                />
+              </div>
+            </SheetContent>
+          </Sheet>
+
+          {/* Logo */}
+          <Link href="/dashboard" className="flex items-center gap-2 shrink-0">
+            <div className="flex h-7 w-7 items-center justify-center rounded-md bg-primary/10 text-primary">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M2 17a5 5 0 0 0 10 0c0-2.76-2.24-5-5-5s-5 2.24-5 5Z"/>
+                <path d="M12 17a5 5 0 0 0 10 0c0-2.76-2.24-5-5-5s-5 2.24-5 5Z"/>
+                <path d="M7 7a5 5 0 0 0 10 0c0-2.76-2.24-5-5-5S7 4.24 7 7Z"/>
+              </svg>
+            </div>
+            <span className="text-sm font-semibold tracking-tight hidden sm:inline">
+              {householdName}
+            </span>
+          </Link>
+
+          {/* Desktop nav links */}
+          <div className="hidden md:flex flex-1">
+            <NavLinks pathname={pathname} />
+          </div>
+
+          {/* Spacer for mobile */}
+          <div className="flex-1 md:hidden" />
+
+          {/* User avatar → account page */}
+          <Link
+            href="/dashboard/account"
+            className={cn(
+              "flex items-center gap-2 rounded-full p-0.5 transition-colors hover:bg-accent",
+              pathname === "/dashboard/account" && "ring-2 ring-primary ring-offset-2"
+            )}
+          >
+            <Avatar className="h-8 w-8">
+              {user.avatar_url && <AvatarImage src={user.avatar_url} />}
+              <AvatarFallback className="text-[10px] font-semibold">
+                {initials}
+              </AvatarFallback>
+            </Avatar>
+          </Link>
+        </div>
+      </header>
+
+      {/* Page content */}
+      <main className="flex-1 overflow-y-auto p-5 md:p-8 lg:p-10">
+        {children}
+      </main>
+    </div>
+  );
+}

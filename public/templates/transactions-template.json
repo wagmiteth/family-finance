@@ -1,0 +1,41 @@
+[
+  {
+    "description": "ICA Maxi Lindhagen",
+    "date": "2025-01-15",
+    "amount": -523.50,
+    "transaction_type": "expense",
+    "category": "Groceries",
+    "subcategory": "Food",
+    "tags": ["groceries", "weekly"],
+    "notes": "Weekly shopping",
+    "bank_name": "Nordea",
+    "account_number": "1234-567890",
+    "account_name": "Privatkonto"
+  },
+  {
+    "description": "Spotify Premium",
+    "date": "2025-01-15",
+    "amount": -129.00,
+    "transaction_type": "expense",
+    "category": "Subscriptions",
+    "subcategory": "Entertainment",
+    "tags": ["subscription"],
+    "notes": null,
+    "bank_name": "SEB",
+    "account_number": "9876-543210",
+    "account_name": "Lönekonto"
+  },
+  {
+    "description": "Lön Januari",
+    "date": "2025-01-25",
+    "amount": 35000.00,
+    "transaction_type": "income",
+    "category": "Salary",
+    "subcategory": null,
+    "tags": null,
+    "notes": null,
+    "bank_name": "Nordea",
+    "account_number": "1234-567890",
+    "account_name": "Privatkonto"
+  }
+]
