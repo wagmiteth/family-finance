@@ -1,6 +1,6 @@
 # Vercel Multi-Account CLI Setup
 
-**Status:** Complete — GitHub auto-deploy verified
+**Status:** Complete — GitHub auto-deploy active
 
 ## Context
 Deploy family-finance to a new Vercel account (oskar.carljohan.carlsson@gmail.com) separate from the legacy account (nsnodes@gmail.com for PNW/wagmit), and set up CLI so both accounts can be controlled from the terminal — including from Claude Code sessions.
