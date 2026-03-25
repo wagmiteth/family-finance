@@ -20,8 +20,12 @@ export default function RootLayout({
           {children}
         </EncryptionProvider>
         <Toaster
+          closeButton
           toastOptions={{
             className: "font-sans",
+            classNames: {
+              description: "!text-foreground !opacity-80",
+            },
           }}
         />
       </body>

@@ -27,7 +27,7 @@ export async function POST(request: Request) {
       transactions,
       user_id,
     }: {
-      transactions: { encrypted_data: string; import_hash: string; category_id?: string | null }[];
+      transactions: { encrypted_data: string; import_hash: string; legacy_hash?: string; category_id?: string | null }[];
       user_id: string;
     } = body;
 
@@ -58,33 +58,65 @@ export async function POST(request: Request) {
       );
     }
 
-    // Check for duplicates by import_hash
-    const hashes = transactions.map((t) => t.import_hash);
-    const { data: existing } = await supabase
-      .from("transactions")
-      .select("import_hash")
-      .eq("household_id", household_id)
-      .in("import_hash", hashes);
+    // Collect all hashes to check: both new-format and legacy hashes
+    const newHashes = transactions.map((t) => t.import_hash);
+    const legacyHashes = transactions
+      .map((t) => t.legacy_hash)
+      .filter((h): h is string => !!h);
+    const allHashesToCheck = [...new Set([...newHashes, ...legacyHashes])];
 
-    const existingHashes = new Set(
-      (existing || []).map((e: { import_hash: string }) => e.import_hash)
-    );
+    // Query existing hashes in chunks (PostgREST URL length limit ~8KB)
+    const HASH_CHUNK = 100;
+    const existingHashes = new Set<string>();
+    for (let i = 0; i < allHashesToCheck.length; i += HASH_CHUNK) {
+      const chunk = allHashesToCheck.slice(i, i + HASH_CHUNK);
+      const { data: existing } = await supabase
+        .from("transactions")
+        .select("import_hash")
+        .eq("household_id", household_id)
+        .in("import_hash", chunk);
+      for (const e of existing || []) {
+        existingHashes.add((e as { import_hash: string }).import_hash);
+      }
+    }
 
-    const newTransactions = transactions.filter(
-      (t) => !existingHashes.has(t.import_hash)
-    );
+    // Categorise skip reasons
+    let skippedExactHash = 0;
+    let skippedLegacyHash = 0;
+    const newTransactions: typeof transactions = [];
+
+    for (const t of transactions) {
+      if (existingHashes.has(t.import_hash)) {
+        skippedExactHash++;
+      } else if (t.legacy_hash && existingHashes.has(t.legacy_hash)) {
+        skippedLegacyHash++;
+      } else {
+        newTransactions.push(t);
+      }
+    }
 
     const duplicateCount = transactions.length - newTransactions.length;
+
+    // Count how many transactions exist before this import (structural metadata)
+    const { count: existingCount } = await supabase
+      .from("transactions")
+      .select("id", { count: "exact", head: true })
+      .eq("household_id", household_id);
+
+    const totalBefore = existingCount ?? 0;
 
     if (newTransactions.length === 0) {
       return NextResponse.json({
         imported: 0,
         duplicates: duplicateCount,
+        skipped_exact: skippedExactHash,
+        skipped_legacy: skippedLegacyHash,
+        total_before: totalBefore,
         transactions: [],
       });
     }
 
-    // Create upload batch with encrypted file_names
+    // Create upload batch with encrypted metadata
     const { data: batch } = await supabase
       .from("upload_batches")
       .insert({
@@ -126,6 +158,9 @@ export async function POST(request: Request) {
     return NextResponse.json({
       imported: (inserted ?? []).length,
       duplicates: duplicateCount,
+      skipped_exact: skippedExactHash,
+      skipped_legacy: skippedLegacyHash,
+      total_before: totalBefore,
       transactions: inserted ?? [],
     });
   } catch (err) {

@@ -58,6 +58,7 @@ export interface Transaction {
   enriched_address: string | null; // encrypted
   enriched_at: string | null; // encrypted
   import_hash: string;
+  batch_id: string | null;
   created_at: string;
   updated_at: string;
 }

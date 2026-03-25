@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
+import { useSearchParams } from "next/navigation";
 import {
   Tabs,
   TabsContent,
@@ -70,10 +71,13 @@ import { getDEK } from "@/lib/crypto/key-store";
 import { InviteBanner } from "@/components/invite-banner";
 
 export default function SettingsPage() {
+  const searchParams = useSearchParams();
+  const defaultTab = searchParams.get("tab") || "household";
+
   return (
     <div className="space-y-6">
       <h1 className="text-2xl font-bold">Settings</h1>
-      <Tabs defaultValue="household">
+      <Tabs defaultValue={defaultTab}>
         <TabsList>
           <TabsTrigger value="household">Household</TabsTrigger>
           <TabsTrigger value="categories">Categories</TabsTrigger>

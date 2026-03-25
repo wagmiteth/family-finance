@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import {
   format,
   startOfMonth,
@@ -49,6 +49,9 @@ import {
   Loader2,
   GripVertical,
   Wand2,
+  ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
 } from "lucide-react";
 import { toast } from "sonner";
 import type { Transaction, Category, User, MerchantRule, Settlement } from "@/lib/types";
@@ -695,6 +698,8 @@ export default function TransactionsPage() {
   const settledTransactionIds = getSettledTransactionIds(data.settlements);
   const loading = data.loading && data.lastFetched === 0;
   const [userFilter, setUserFilter] = useState<string>("all");
+  const [sortField, setSortField] = useState<"date" | "description" | "amount">("date");
+  const [sortDirection, setSortDirection] = useState<"asc" | "desc">("desc");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [activeId, setActiveId] = useState<string | null>(null);
   const [overColumnId, setOverColumnId] = useState<string | null>(null);
@@ -780,10 +785,18 @@ export default function TransactionsPage() {
     }
   }, [categories, currentUser?.id]);
 
-  const filteredTransactions =
-    userFilter === "all"
+  const filteredTransactions = useMemo(() => {
+    const base = userFilter === "all"
       ? transactions
       : transactions.filter((t) => t.user_id === userFilter);
+    // Guard against duplicate IDs (e.g. from state merges after import)
+    const seen = new Set<string>();
+    return base.filter((t) => {
+      if (seen.has(t.id)) return false;
+      seen.add(t.id);
+      return true;
+    });
+  }, [transactions, userFilter]);
 
   const uncategorizedCat = categories.find((c) => c.name === "uncategorized");
 
@@ -803,12 +816,34 @@ export default function TransactionsPage() {
   const collisionDetection = smartCollision(columnDroppableIds, sortableColumnIds, draggingColumnIdRef);
 
   function getColumnTransactions(columnId: string) {
+    let txns: Transaction[];
     if (uncategorizedCat && columnId === uncategorizedCat.id) {
-      return filteredTransactions.filter(
+      txns = filteredTransactions.filter(
         (t) => !t.category_id || t.category_id === columnId
       );
+    } else {
+      txns = filteredTransactions.filter((t) => t.category_id === columnId);
     }
-    return filteredTransactions.filter((t) => t.category_id === columnId);
+
+    const dir = sortDirection === "asc" ? 1 : -1;
+    return [...txns].sort((a, b) => {
+      let cmp = 0;
+      switch (sortField) {
+        case "date":
+          cmp = (a.date || "").localeCompare(b.date || "");
+          break;
+        case "description": {
+          const nameA = (a.enriched_name || a.description || "").toLowerCase();
+          const nameB = (b.enriched_name || b.description || "").toLowerCase();
+          cmp = nameA.localeCompare(nameB);
+          break;
+        }
+        case "amount":
+          cmp = Math.abs(a.amount) - Math.abs(b.amount);
+          break;
+      }
+      return cmp * dir;
+    });
   }
 
   // Figure out which IDs are being dragged (active + selected if active is selected)
@@ -983,13 +1018,19 @@ export default function TransactionsPage() {
         return;
       }
 
+      // Sync optimistic update to DataProvider cache so navigation doesn't revert
+      data.updateTransactions((prev) =>
+        prev.map((t) =>
+          mutableIds.includes(t.id) ? { ...t, category_id: resolvedTargetId } : t
+        )
+      );
       toast.success(`Moved ${mutableIds.length} transaction(s)`);
 
       // Auto-create/update merchant rules (skip for Deleted/Uncategorized, but include Exclude)
       const targetCat = categories.find((c) => c.id === resolvedTargetId);
       const isExclude = targetCat?.name === "exclude";
       const isDeleted = targetCat?.name === "deleted";
-      const skipAutoLearn = !resolvedTargetId || (isDeleted || (!isExclude && targetCat?.split_type === "none"));
+      const skipAutoLearn = !resolvedTargetId || isDeleted;
 
       if (!skipAutoLearn) {
         // Use the pre-optimistic-update transactions to get descriptions
@@ -1064,6 +1105,15 @@ export default function TransactionsPage() {
           await Promise.all(rulePromises);
           // Refresh rules via cache
           await data.refreshMerchantRules();
+          const parts: string[] = [];
+          if (toCreate.length > 0) parts.push(`${toCreate.length} rule(s) created`);
+          if (toUpdate.length > 0) parts.push(`${toUpdate.length} rule(s) updated`);
+          toast.success(parts.join(", "), {
+            action: {
+              label: "Edit rules",
+              onClick: () => window.location.assign("/dashboard/settings?tab=rules"),
+            },
+          });
         }
       }
     } catch {
@@ -1143,7 +1193,23 @@ export default function TransactionsPage() {
       }
 
       if (successCount > 0) {
-        toast.success(`Auto-sorted ${successCount} transaction${successCount > 1 ? "s" : ""}`);
+        const categoryMap = new Map(categories.map((c) => [c.id, c.name || c.display_name || "Unknown"]));
+        const lines = matches.map((m) => {
+          const tx = uncategorizedTxs.find((t) => t.id === m.transactionId);
+          const desc = tx?.description || "Unknown";
+          const cat = categoryMap.get(m.categoryId) || "Unknown";
+          return { desc, cat };
+        });
+        toast.success(`Auto-sorted ${successCount} transaction${successCount > 1 ? "s" : ""}`, {
+          description: (
+            <ul className="mt-1 space-y-0.5 text-xs">
+              {lines.map((l, i) => (
+                <li key={i}>{l.desc} → <span className="font-medium">{l.cat}</span></li>
+              ))}
+            </ul>
+          ),
+          duration: 8000,
+        });
       }
     } catch {
       toast.error("Failed to auto-sort some transactions");
@@ -1194,6 +1260,10 @@ export default function TransactionsPage() {
     setTransactions((prev) =>
       prev.map((t) => (t.id === updated.id ? updated : t))
     );
+    // Sync to DataProvider cache so navigation doesn't revert
+    data.updateTransactions((prev) =>
+      prev.map((t) => (t.id === updated.id ? updated : t))
+    );
   }
 
   async function handleCardChangeUser(transactionId: string, userId: string) {
@@ -1223,6 +1293,12 @@ export default function TransactionsPage() {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ user_id: userId }),
           })
+        )
+      );
+      // Sync optimistic update to DataProvider cache so navigation doesn't revert
+      data.updateTransactions((prev) =>
+        prev.map((t) =>
+          mutableIds.includes(t.id) ? { ...t, user_id: userId } : t
         )
       );
       const userName = users.find((u) => u.id === userId)?.name || "user";
@@ -1264,7 +1340,97 @@ export default function TransactionsPage() {
         fetchData();
         return;
       }
+      // Sync optimistic update to DataProvider cache so navigation doesn't revert
+      data.updateTransactions((prev) =>
+        prev.map((t) =>
+          mutableIds.includes(t.id) ? { ...t, category_id: categoryId } : t
+        )
+      );
       toast.success(`Updated category for ${mutableIds.length} transaction(s)`);
+
+      // Auto-create/update merchant rules (same logic as drag-and-drop)
+      const targetCat = categories.find((c) => c.id === categoryId);
+      const isDeleted = targetCat?.name === "deleted";
+      const skipAutoLearn = !categoryId || isDeleted;
+
+      if (!skipAutoLearn) {
+        const movedTxs = transactions.filter((t) => mutableIds.includes(t.id));
+        const uniqueDescriptions = [
+          ...new Set(
+            movedTxs
+              .map((t) => t.description?.toLowerCase().trim())
+              .filter((d): d is string => !!d && d !== "[encrypted]" && d !== "[decryption failed]")
+          ),
+        ];
+
+        const toCreate: string[] = [];
+        const toUpdate: { id: string; desc: string }[] = [];
+
+        for (const desc of uniqueDescriptions) {
+          const existing = merchantRules.find(
+            (r) => r.pattern.toLowerCase() === desc
+          );
+          if (existing) {
+            if (existing.category_id !== categoryId) {
+              toUpdate.push({ id: existing.id, desc });
+            }
+          } else {
+            toCreate.push(desc);
+          }
+        }
+
+        const rulePromises: Promise<unknown>[] = [];
+
+        for (const item of toUpdate) {
+          rulePromises.push(
+            fetch("/api/merchant-rules", {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ id: item.id, category_id: categoryId }),
+            })
+          );
+        }
+
+        for (const desc of toCreate) {
+          rulePromises.push(
+            (async () => {
+              const encrypted_data = await encryptMerchantRule({
+                pattern: desc,
+                rule_type: "pattern",
+                match_transaction_type: null,
+                merchant_name: null,
+                merchant_type: null,
+                amount_hint: null,
+                amount_max: null,
+                notes: null,
+              });
+              return fetch("/api/merchant-rules", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  encrypted_data,
+                  category_id: categoryId,
+                  is_learned: true,
+                }),
+              });
+            })()
+          );
+        }
+
+        if (rulePromises.length > 0) {
+          await Promise.all(rulePromises);
+          await data.refreshMerchantRules();
+          const parts: string[] = [];
+          if (toCreate.length > 0) parts.push(`${toCreate.length} rule(s) created`);
+          if (toUpdate.length > 0) parts.push(`${toUpdate.length} rule(s) updated`);
+          toast.success(parts.join(", "), {
+            action: {
+              label: "Edit rules",
+              onClick: () => window.location.assign("/dashboard/settings?tab=rules"),
+            },
+          });
+        }
+      }
     } catch {
       toast.error("Failed to update category");
       fetchData();
@@ -1301,25 +1467,54 @@ export default function TransactionsPage() {
         </div>
       </div>
 
-      {/* User filter tabs */}
-      <div className="flex gap-2">
-        <Button
-          variant={userFilter === "all" ? "default" : "outline"}
-          size="sm"
-          onClick={() => setUserFilter("all")}
-        >
-          All
-        </Button>
-        {users.map((u) => (
+      {/* User filter tabs + Sort controls */}
+      <div className="flex items-center justify-between gap-4">
+        <div className="flex gap-2">
           <Button
-            key={u.id}
-            variant={userFilter === u.id ? "default" : "outline"}
+            variant={userFilter === "all" ? "default" : "outline"}
             size="sm"
-            onClick={() => setUserFilter(u.id)}
+            onClick={() => setUserFilter("all")}
           >
-            {u.name}
+            All
           </Button>
-        ))}
+          {users.map((u) => (
+            <Button
+              key={u.id}
+              variant={userFilter === u.id ? "default" : "outline"}
+              size="sm"
+              onClick={() => setUserFilter(u.id)}
+            >
+              {u.name}
+            </Button>
+          ))}
+        </div>
+
+        <div className="flex items-center gap-1">
+          <ArrowUpDown className="h-3.5 w-3.5 text-muted-foreground mr-1" />
+          {(["date", "description", "amount"] as const).map((field) => (
+            <Button
+              key={field}
+              variant={sortField === field ? "default" : "outline"}
+              size="sm"
+              className="h-7 px-2 text-xs capitalize"
+              onClick={() => {
+                if (sortField === field) {
+                  setSortDirection((d) => (d === "asc" ? "desc" : "asc"));
+                } else {
+                  setSortField(field);
+                  setSortDirection(field === "description" ? "asc" : "desc");
+                }
+              }}
+            >
+              {field}
+              {sortField === field && (
+                sortDirection === "asc"
+                  ? <ArrowUp className="h-3 w-3 ml-0.5" />
+                  : <ArrowDown className="h-3 w-3 ml-0.5" />
+              )}
+            </Button>
+          ))}
+        </div>
       </div>
 
       {loading ? (

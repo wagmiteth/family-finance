@@ -80,3 +80,60 @@ export async function DELETE(
     );
   }
 }
+
+export async function PATCH(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    const { id } = await params;
+    const supabase = await createClient();
+    const {
+      data: { user: authUser },
+    } = await supabase.auth.getUser();
+
+    if (!authUser) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const { data: appUser } = await supabase
+      .from("users")
+      .select()
+      .eq("auth_id", authUser.id)
+      .single();
+
+    if (!appUser) {
+      return NextResponse.json({ error: "User not found" }, { status: 404 });
+    }
+
+    const { encrypted_data } = await request.json();
+
+    if (typeof encrypted_data !== "string") {
+      return NextResponse.json(
+        { error: "encrypted_data is required" },
+        { status: 400 }
+      );
+    }
+
+    const { error } = await supabase
+      .from("upload_batches")
+      .update({ encrypted_data })
+      .eq("id", id)
+      .eq("household_id", appUser.household_id);
+
+    if (error) {
+      return NextResponse.json(
+        { error: "Failed to update batch" },
+        { status: 500 }
+      );
+    }
+
+    return NextResponse.json({ success: true });
+  } catch (err) {
+    console.error("[upload-batch PATCH]", err);
+    return NextResponse.json(
+      { error: "Internal server error" },
+      { status: 500 }
+    );
+  }
+}
