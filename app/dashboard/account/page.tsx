@@ -29,6 +29,13 @@ import { Download, Trash2, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
 import { decryptEntity, encryptUser } from "@/lib/crypto/entity-crypto";
 import { getDEK } from "@/lib/crypto/key-store";
+import {
+  generateSalt,
+  deriveKEK,
+  wrapDEK,
+  toBase64,
+  KDF_ITERATIONS,
+} from "@/lib/crypto/client-crypto";
 import type { User, Transaction } from "@/lib/types";
 
 export default function AccountPage() {
@@ -163,17 +170,51 @@ export default function AccountPage() {
       toast.error("Passwords do not match");
       return;
     }
+
+    const dek = getDEK();
+    if (!dek) {
+      toast.error("Encryption must be unlocked to change password");
+      return;
+    }
+
     setChangingPassword(true);
     try {
+      // 1. Generate new salt and derive new KEK from new password
+      const newSalt = generateSalt();
+      const newKEK = await deriveKEK(newPassword, newSalt, KDF_ITERATIONS);
+
+      // 2. Re-wrap the existing DEK with the new KEK
+      const newWrappedDEK = await wrapDEK(dek, newKEK);
+
+      // 3. Save new key material to the server
+      const keyRes = await fetch("/api/user/key-material", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          salt: toBase64(newSalt),
+          iterations: KDF_ITERATIONS,
+          wrapped_dek: toBase64(newWrappedDEK),
+        }),
+      });
+
+      if (!keyRes.ok) {
+        toast.error("Failed to update encryption keys");
+        return;
+      }
+
+      // 4. Only update auth password after key material is saved
       const { error } = await supabase.auth.updateUser({
         password: newPassword,
       });
+
       if (error) {
-        toast.error(error.message);
-      } else {
-        toast.success(
-          "Password updated. Remember: this is also your encryption key."
+        // Key material was updated but auth password failed — roll back would
+        // require the old password, so warn the user clearly.
+        toast.error(
+          `Auth password update failed: ${error.message}. Your encryption keys were already updated — use your NEW password to unlock.`
         );
+      } else {
+        toast.success("Password and encryption keys updated successfully");
         setNewPassword("");
         setConfirmPassword("");
       }
@@ -337,10 +378,10 @@ export default function AccountPage() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/50 dark:text-amber-200">
-            <strong>Warning:</strong> Changing your password will not
-            re-encrypt existing data automatically. If you have client-side
-            encrypted data, you may need to re-wrap your encryption keys.
+          <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-xs text-blue-800 dark:border-blue-900 dark:bg-blue-950/50 dark:text-blue-200">
+            Your password is your encryption key. Changing it will
+            automatically re-wrap your encryption keys — your data stays
+            intact.
           </div>
           <div className="space-y-2">
             <Label htmlFor="newPassword">New Password</Label>

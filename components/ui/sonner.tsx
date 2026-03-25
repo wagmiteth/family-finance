@@ -1,22 +1,14 @@
 "use client"
 
 import { useTheme } from "next-themes"
-import { toast, Toaster as Sonner, type ToasterProps } from "sonner"
-import { useRef } from "react"
+import { Toaster as Sonner, type ToasterProps } from "sonner"
 import { CircleCheckIcon, InfoIcon, TriangleAlertIcon, OctagonXIcon, Loader2Icon } from "lucide-react"
 
 const Toaster = ({ ...props }: ToasterProps) => {
   const { theme = "system" } = useTheme()
-  const dismissing = useRef(false)
 
   return (
     <Sonner
-      onDismiss={() => {
-        if (dismissing.current) return
-        dismissing.current = true
-        toast.dismiss()
-        dismissing.current = false
-      }}
       theme={theme as ToasterProps["theme"]}
       className="toaster group"
       icons={{

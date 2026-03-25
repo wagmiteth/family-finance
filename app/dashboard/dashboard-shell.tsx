@@ -13,14 +13,25 @@ import {
   SheetTrigger,
 } from "@/components/ui/sheet";
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
   LayoutDashboard,
   ArrowLeftRight,
   Upload,
   Calculator,
   Settings,
   Menu,
+  LogOut,
+  User,
 } from "lucide-react";
 import { useState, useEffect } from "react";
+import { useRouter } from "next/navigation";
+import { createClient } from "@/lib/supabase/client";
 import { decryptEntity } from "@/lib/crypto/entity-crypto";
 import { getDEK } from "@/lib/crypto/key-store";
 import { useEncryption } from "@/lib/crypto/encryption-context";
@@ -86,8 +97,9 @@ export function DashboardShell({
   children: React.ReactNode;
 }) {
   const pathname = usePathname();
+  const router = useRouter();
   const [mobileOpen, setMobileOpen] = useState(false);
-  const { isUnlocked } = useEncryption();
+  const { isUnlocked, lock } = useEncryption();
 
   // Decrypted state
   const [userName, setUserName] = useState(rawUser.email as string || "");
@@ -178,21 +190,40 @@ export function DashboardShell({
           {/* Spacer for mobile */}
           <div className="flex-1 md:hidden" />
 
-          {/* User avatar → account page */}
-          <Link
-            href="/dashboard/account"
-            className={cn(
-              "flex items-center gap-2 rounded-full p-0.5 transition-colors hover:bg-accent",
-              pathname === "/dashboard/account" && "ring-2 ring-primary ring-offset-2"
-            )}
-          >
-            <Avatar className="h-8 w-8">
-              {avatarUrl && <AvatarImage src={avatarUrl} />}
-              <AvatarFallback className="text-[10px] font-semibold">
-                {initials}
-              </AvatarFallback>
-            </Avatar>
-          </Link>
+          {/* User menu */}
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              className={cn(
+                "flex items-center gap-2 rounded-full p-0.5 transition-colors hover:bg-accent focus:outline-none",
+                pathname === "/dashboard/account" && "ring-2 ring-primary ring-offset-2"
+              )}
+            >
+              <Avatar className="h-8 w-8">
+                {avatarUrl && <AvatarImage src={avatarUrl} />}
+                <AvatarFallback className="text-[10px] font-semibold">
+                  {initials}
+                </AvatarFallback>
+              </Avatar>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-40">
+              <DropdownMenuItem onClick={() => router.push("/dashboard/account")}>
+                <User className="mr-2 h-4 w-4" />
+                Account
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onClick={async () => {
+                  lock();
+                  const supabase = createClient();
+                  await supabase.auth.signOut();
+                  router.push("/login");
+                }}
+              >
+                <LogOut className="mr-2 h-4 w-4" />
+                Log out
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </header>
 

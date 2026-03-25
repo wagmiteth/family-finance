@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEncryption } from "@/lib/crypto/encryption-context";
 import {
@@ -37,7 +37,15 @@ import { InviteBanner } from "@/components/invite-banner";
 
 type Step = "choose" | "create" | "join";
 
-export default function OnboardingPage() {
+export default function OnboardingPageWrapper() {
+  return (
+    <Suspense>
+      <OnboardingPage />
+    </Suspense>
+  );
+}
+
+function OnboardingPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const { isUnlocked } = useEncryption();
