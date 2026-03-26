@@ -23,12 +23,22 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "User not found" }, { status: 404 });
     }
 
-    const { transactionIds, test, descriptions, apiKey } = await request.json();
+    const { transactionIds, test, descriptions, apiKey: clientApiKey } = await request.json();
 
-    // API key is now provided by the client (decrypted client-side from encrypted blob)
+    // Resolve API key: prefer client-provided, fall back to stored key
+    let apiKey = clientApiKey;
+    if (!apiKey) {
+      const { data: settings } = await supabase
+        .from("user_settings")
+        .select("encrypted_api_key")
+        .eq("user_id", appUser.id)
+        .single();
+      apiKey = settings?.encrypted_api_key;
+    }
+
     if (typeof apiKey !== "string" || !apiKey) {
       return NextResponse.json(
-        { error: "apiKey is required (decrypted client-side)" },
+        { error: "No API key configured. Add one in Settings." },
         { status: 400 }
       );
     }

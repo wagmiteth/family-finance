@@ -35,13 +35,15 @@ export async function GET() {
       );
     }
 
-    // Return the encrypted blob — client decrypts to check/display
+    const hasKey = !!settings.encrypted_api_key;
     return NextResponse.json({
       user_id: settings.user_id,
       theme: settings.theme,
       updated_at: settings.updated_at,
-      has_api_key: !!settings.encrypted_api_key,
-      encrypted_api_key: settings.encrypted_api_key,
+      has_api_key: hasKey,
+      masked_api_key: hasKey
+        ? settings.encrypted_api_key.slice(0, 7) + "••••" + settings.encrypted_api_key.slice(-4)
+        : null,
     });
   } catch {
     return NextResponse.json(
@@ -79,9 +81,9 @@ export async function PATCH(request: Request) {
 
     if (body.theme !== undefined) updates.theme = body.theme;
 
-    // API key is now client-encrypted — stored as encrypted blob
-    if ("encrypted_api_key" in body) {
-      updates.encrypted_api_key = body.encrypted_api_key ?? null;
+    // API key stored server-side (plaintext in DB, not zero-knowledge)
+    if ("anthropic_api_key" in body) {
+      updates.encrypted_api_key = body.anthropic_api_key || null;
     }
 
     const { data: settings, error } = await supabase
