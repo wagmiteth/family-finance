@@ -38,8 +38,8 @@ import { useEncryption } from "@/lib/crypto/encryption-context";
 
 const navItems = [
   { href: "/dashboard", label: "Overview", icon: LayoutDashboard },
-  { href: "/dashboard/transactions", label: "Transactions", icon: ArrowLeftRight },
   { href: "/dashboard/upload", label: "Upload", icon: Upload },
+  { href: "/dashboard/transactions", label: "Transactions", icon: ArrowLeftRight },
   { href: "/dashboard/settlements", label: "Settlements", icon: Calculator },
   { href: "/dashboard/settings", label: "Settings", icon: Settings },
 ];
