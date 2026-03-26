@@ -287,6 +287,11 @@ function TransactionCard({
                 Settled
               </Badge>
             )}
+            {transaction.transaction_type === SETTLEMENT_TRANSACTION_TYPE && (
+              <Badge variant="outline" className="h-4 px-1 text-[9px] border-emerald-200 bg-emerald-50/80 text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-400">
+                Settlement
+              </Badge>
+            )}
             {transaction.enriched_info && (
               <span className="text-[10px] text-amber-600 dark:text-amber-400">
                 · {transaction.enriched_info}
@@ -1229,6 +1234,14 @@ export default function TransactionsPage() {
       }
 
       if (successCount > 0) {
+        // Sync optimistic update to DataProvider cache so other effects don't revert it
+        data.updateTransactions((prev) =>
+          prev.map((t) => {
+            const match = matches.find((m) => m.transactionId === t.id);
+            return match ? { ...t, category_id: match.categoryId } : t;
+          })
+        );
+
         const categoryMap = new Map(categories.map((c) => [c.id, c.name || c.display_name || "Unknown"]));
         const lines = matches.map((m) => {
           const tx = uncategorizedTxs.find((t) => t.id === m.transactionId);
@@ -1249,8 +1262,13 @@ export default function TransactionsPage() {
           action: {
             label: "Undo",
             onClick: async () => {
-              // Optimistic revert
+              // Optimistic revert — both local state and DataProvider cache
               setTransactions((prev) =>
+                prev.map((t) =>
+                  sortedIds.includes(t.id) ? { ...t, category_id: null } : t
+                )
+              );
+              data.updateTransactions((prev) =>
                 prev.map((t) =>
                   sortedIds.includes(t.id) ? { ...t, category_id: null } : t
                 )
@@ -1358,12 +1376,18 @@ export default function TransactionsPage() {
       return;
     }
 
+    const excludeCat = categories.find((c) => c.name === "exclude");
+
     setSettlementToggling(true);
     try {
-
       const updated: Transaction = isCurrentlySettlement
         ? { ...transaction, transaction_type: null, payment_allocations: null }
-        : { ...transaction, transaction_type: SETTLEMENT_TRANSACTION_TYPE, payment_allocations: null };
+        : {
+            ...transaction,
+            transaction_type: SETTLEMENT_TRANSACTION_TYPE,
+            payment_allocations: null,
+            category_id: excludeCat?.id ?? transaction.category_id,
+          };
 
       const encrypted_data = await encryptTransaction(
         updated as unknown as Record<string, unknown>
@@ -1371,7 +1395,10 @@ export default function TransactionsPage() {
       const res = await fetch(`/api/transactions/${transaction.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ encrypted_data }),
+        body: JSON.stringify({
+          encrypted_data,
+          ...(!isCurrentlySettlement && excludeCat ? { category_id: excludeCat.id } : {}),
+        }),
       });
 
       if (!res.ok) {
@@ -1384,8 +1411,14 @@ export default function TransactionsPage() {
         toast.success("Transaction unmarked as settlement payment");
       } else {
         toast.success(
-          "Marked as settlement payment. Use Record Payment on the Settlements page to allocate it across months.",
-          { duration: 5000 }
+          `Marked as settlement payment and moved to ${excludeCat?.display_name || "Exclude"}.`,
+          {
+            duration: 5000,
+            action: {
+              label: "Settlement history",
+              onClick: () => window.location.assign("/dashboard/settlements"),
+            },
+          }
         );
       }
     } catch {

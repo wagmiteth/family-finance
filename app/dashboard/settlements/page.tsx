@@ -378,7 +378,8 @@ function buildMonthlySettlementViews(
       .map((category) => category.id)
   );
 
-  return [...months]
+  // First pass: build views using only explicitly allocated payments
+  const views = [...months]
     .map((month) => {
       const monthTransactions = transactions.filter(
         (transaction) =>
@@ -444,6 +445,41 @@ function buildMonthlySettlementViews(
         view.record
     )
     .sort((left, right) => right.month.localeCompare(left.month));
+
+  // Second pass: auto-allocate unallocated settlement payments (marked from
+  // the transactions page without FIFO allocation) against remaining balances
+  const unallocatedPayments = transactions.filter(
+    (tx) =>
+      tx.transaction_type === "settlement" &&
+      (!tx.payment_allocations || tx.payment_allocations.length === 0) &&
+      tx.amount > 0
+  );
+
+  if (unallocatedPayments.length > 0) {
+    // Sort oldest first for stable FIFO
+    const sorted = [...unallocatedPayments].sort((a, b) =>
+      a.date.localeCompare(b.date)
+    );
+
+    // Process months oldest-first for FIFO
+    const monthsAsc = [...views]
+      .sort((a, b) => a.month.localeCompare(b.month));
+
+    for (const tx of sorted) {
+      let remaining = Math.abs(tx.amount);
+      for (const view of monthsAsc) {
+        if (remaining < 0.01) break;
+        if (view.remainingOwed < 0.01) continue;
+
+        const applied = Math.min(remaining, view.remainingOwed);
+        view.paymentsApplied = Math.round((view.paymentsApplied + applied) * 100) / 100;
+        view.remainingOwed = Math.max(0, Math.round((view.remainingOwed - applied) * 100) / 100);
+        remaining -= applied;
+      }
+    }
+  }
+
+  return views;
 }
 
 function TransferSummary({
