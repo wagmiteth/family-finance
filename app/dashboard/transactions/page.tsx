@@ -55,7 +55,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import type { Transaction, Category, User, MerchantRule, Settlement } from "@/lib/types";
-import { encryptMerchantRule } from "@/lib/crypto/entity-crypto";
+import { encryptMerchantRule, encryptTransaction } from "@/lib/crypto/entity-crypto";
 import { useData } from "@/lib/crypto/data-provider";
 import { TransactionDetailDialog } from "@/components/transaction-detail-dialog";
 
@@ -1237,16 +1237,31 @@ export default function TransactionsPage() {
         return;
       }
 
-      const data = await res.json();
-      if (data.enriched > 0) {
-        const txRes = await fetch(`/api/transactions/${tx.id}`);
-        if (txRes.ok) {
-          const updated = await txRes.json();
-          setDetailTransaction(updated);
-          setTransactions((prev) =>
-            prev.map((t) => (t.id === updated.id ? updated : t))
-          );
-        }
+      const enrichData = await res.json();
+      if (enrichData.enriched > 0 && enrichData.results?.[0]) {
+        const result = enrichData.results[0];
+        const updated: Transaction = {
+          ...tx,
+          enriched_name: result.merchant_name ?? tx.enriched_name,
+          enriched_info: result.merchant_type ?? tx.enriched_info,
+          enriched_description: result.merchant_description ?? tx.enriched_description,
+          enriched_address: result.merchant_address ?? tx.enriched_address,
+        };
+
+        // Encrypt and save back to server
+        const encrypted_data = await encryptTransaction(
+          updated as unknown as Record<string, unknown>
+        );
+        await fetch(`/api/transactions/${tx.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ encrypted_data }),
+        });
+
+        setDetailTransaction(updated);
+        setTransactions((prev) =>
+          prev.map((t) => (t.id === updated.id ? updated : t))
+        );
         toast.success("Transaction enriched");
       } else {
         toast.error("Enrichment failed");

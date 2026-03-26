@@ -19,7 +19,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { TransactionDetailDialog } from "@/components/transaction-detail-dialog";
 import { useData } from "@/lib/crypto/data-provider";
-import { encryptSettlement } from "@/lib/crypto/entity-crypto";
+import { encryptSettlement, encryptTransaction } from "@/lib/crypto/entity-crypto";
 import {
   buildSettlementBreakdown,
   type SettlementBreakdown,
@@ -1193,19 +1193,31 @@ export default function SettlementsPage() {
         return;
       }
 
-      const result = await res.json();
-      if (result.enriched <= 0) {
+      const enrichData = await res.json();
+      if (enrichData.enriched <= 0 || !enrichData.results?.[0]) {
         toast.error("Enrichment failed");
         return;
       }
 
-      const transactionRes = await fetch(`/api/transactions/${transaction.id}`);
-      if (!transactionRes.ok) {
-        toast.error("Failed to refresh transaction details");
-        return;
-      }
+      const result = enrichData.results[0];
+      const updated: Transaction = {
+        ...transaction,
+        enriched_name: result.merchant_name ?? transaction.enriched_name,
+        enriched_info: result.merchant_type ?? transaction.enriched_info,
+        enriched_description: result.merchant_description ?? transaction.enriched_description,
+        enriched_address: result.merchant_address ?? transaction.enriched_address,
+      };
 
-      const updated = await transactionRes.json();
+      // Encrypt and save back to server
+      const encrypted_data = await encryptTransaction(
+        updated as unknown as Record<string, unknown>
+      );
+      await fetch(`/api/transactions/${transaction.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ encrypted_data }),
+      });
+
       updateTransactions((current) =>
         current.map((candidate) =>
           candidate.id === updated.id ? updated : candidate
