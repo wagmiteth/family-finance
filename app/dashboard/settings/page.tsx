@@ -1058,6 +1058,7 @@ function ApiKeyTab() {
   const [maskedKey, setMaskedKey] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
@@ -1118,6 +1119,28 @@ function ApiKeyTab() {
     }
   }
 
+  async function handleDelete() {
+    setDeleting(true);
+    try {
+      const res = await fetch("/api/user/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ anthropic_api_key: null }),
+      });
+      if (res.ok) {
+        toast.success("API key deleted");
+        setApiKey("");
+        setMaskedKey(null);
+      } else {
+        toast.error("Failed to delete API key");
+      }
+    } catch {
+      toast.error("Failed to delete API key");
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   if (!loaded) {
     return <p className="text-muted-foreground mt-4">Loading...</p>;
   }
@@ -1169,6 +1192,16 @@ function ApiKeyTab() {
               <TestTube className="mr-1 h-4 w-4" />
               {testing ? "Testing..." : "Test Connection"}
             </Button>
+            {maskedKey && (
+              <Button
+                variant="destructive"
+                onClick={handleDelete}
+                disabled={deleting}
+              >
+                <Trash2 className="mr-1 h-4 w-4" />
+                {deleting ? "Deleting..." : "Delete Key"}
+              </Button>
+            )}
           </div>
         </CardContent>
       </Card>
