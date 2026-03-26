@@ -1081,7 +1081,7 @@ function ApiKeyTab() {
       const res = await fetch("/api/user/settings", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ anthropic_api_key: apiKey }),
+        body: JSON.stringify({ anthropic_api_key: apiKey.trim() }),
       });
       if (res.ok) {
         const data = await res.json();
@@ -1167,16 +1167,28 @@ function ApiKeyTab() {
           <div className="space-y-2">
             <Label htmlFor="apiKey">API Key</Label>
             {maskedKey && !apiKey && (
-              <p className="text-sm text-muted-foreground font-mono">
-                Current key: {maskedKey}
-              </p>
+              <div className="flex items-center gap-2">
+                <p className="text-sm text-muted-foreground font-mono">
+                  Current key: {maskedKey}
+                </p>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 px-2 text-destructive hover:text-destructive hover:bg-destructive/10"
+                  onClick={handleDelete}
+                  disabled={deleting}
+                >
+                  <Trash2 className="mr-1 h-3 w-3" />
+                  {deleting ? "Deleting..." : "Delete"}
+                </Button>
+              </div>
             )}
             <Input
               id="apiKey"
               type="password"
               placeholder={maskedKey ? "Enter new key to replace..." : "sk-ant-..."}
               value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
+              onChange={(e) => setApiKey(e.target.value.replace(/\s/g, ""))}
               className="font-mono"
             />
           </div>
@@ -1192,16 +1204,6 @@ function ApiKeyTab() {
               <TestTube className="mr-1 h-4 w-4" />
               {testing ? "Testing..." : "Test Connection"}
             </Button>
-            {maskedKey && (
-              <Button
-                variant="destructive"
-                onClick={handleDelete}
-                disabled={deleting}
-              >
-                <Trash2 className="mr-1 h-4 w-4" />
-                {deleting ? "Deleting..." : "Delete Key"}
-              </Button>
-            )}
           </div>
         </CardContent>
       </Card>
