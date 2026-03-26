@@ -1236,6 +1236,7 @@ export default function TransactionsPage() {
           const cat = categoryMap.get(m.categoryId) || "Unknown";
           return { desc, cat };
         });
+        const sortedIds = matches.map((m) => m.transactionId);
         toast.success(`Auto-sorted ${successCount} transaction${successCount > 1 ? "s" : ""}`, {
           description: (
             <ul className="mt-1 space-y-0.5 text-xs">
@@ -1245,6 +1246,33 @@ export default function TransactionsPage() {
             </ul>
           ),
           duration: 8000,
+          action: {
+            label: "Undo",
+            onClick: async () => {
+              // Optimistic revert
+              setTransactions((prev) =>
+                prev.map((t) =>
+                  sortedIds.includes(t.id) ? { ...t, category_id: null } : t
+                )
+              );
+              try {
+                const res = await fetch("/api/transactions/bulk", {
+                  method: "PATCH",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ transactionIds: sortedIds, category_id: null }),
+                });
+                if (res.ok) {
+                  toast.success("Auto-sort reverted");
+                } else {
+                  toast.error("Failed to revert");
+                  fetchData();
+                }
+              } catch {
+                toast.error("Failed to revert");
+                fetchData();
+              }
+            },
+          },
         });
       }
     } catch {
