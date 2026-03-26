@@ -1225,7 +1225,10 @@ export default function TransactionsPage() {
       const res = await fetch("/api/enrich", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transactionIds: [tx.id] }),
+        body: JSON.stringify({
+          transactionIds: [tx.id],
+          descriptions: [{ id: tx.id, name: tx.description }],
+        }),
       });
 
       if (!res.ok) {

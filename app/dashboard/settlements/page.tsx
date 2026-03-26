@@ -1181,7 +1181,10 @@ export default function SettlementsPage() {
       const res = await fetch("/api/enrich", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transactionIds: [transaction.id] }),
+        body: JSON.stringify({
+          transactionIds: [transaction.id],
+          descriptions: [{ id: transaction.id, name: transaction.description }],
+        }),
       });
 
       if (!res.ok) {
