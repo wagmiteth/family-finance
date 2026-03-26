@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect, useState, useCallback } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import {
   Tabs,
@@ -19,7 +19,6 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
-import { Separator } from "@/components/ui/separator";
 import {
   Select,
   SelectContent,
@@ -53,6 +52,7 @@ import {
   Pencil,
   Key,
   TestTube,
+  AlertTriangle,
   ArrowUp,
   ArrowDown,
   RotateCcw,
@@ -115,30 +115,29 @@ function HouseholdTab() {
   const [user, setUser] = useState<User | null>(null);
   const [household, setHousehold] = useState<Household | null>(null);
   const [members, setMembers] = useState<User[]>([]);
-  const fetchData = useCallback(async () => {
-    const [userRes, householdRes] = await Promise.all([
-      fetch("/api/user"),
-      fetch("/api/household"),
-    ]);
-
-    const dek = getDEK();
-    if (userRes.ok) {
-      const raw = await userRes.json();
-      const decrypted = await decryptEntity(raw, dek);
-      setUser(decrypted as unknown as User);
-    }
-    if (householdRes.ok) {
-      const data = await householdRes.json();
-      const decryptedHousehold = await decryptEntity(data.household, dek);
-      setHousehold(decryptedHousehold as unknown as Household);
-      const decryptedMembers = await decryptEntities(data.members || [], dek);
-      setMembers(decryptedMembers as unknown as User[]);
-    }
-  }, []);
-
   useEffect(() => {
+    async function fetchData() {
+      const [userRes, householdRes] = await Promise.all([
+        fetch("/api/user"),
+        fetch("/api/household"),
+      ]);
+
+      const dek = getDEK();
+      if (userRes.ok) {
+        const raw = await userRes.json();
+        const decrypted = await decryptEntity(raw, dek);
+        setUser(decrypted as unknown as User);
+      }
+      if (householdRes.ok) {
+        const data = await householdRes.json();
+        const decryptedHousehold = await decryptEntity(data.household, dek);
+        setHousehold(decryptedHousehold as unknown as Household);
+        const decryptedMembers = await decryptEntities(data.members || [], dek);
+        setMembers(decryptedMembers as unknown as User[]);
+      }
+    }
     fetchData();
-  }, [fetchData]);
+  }, []);
 
   return (
     <div className="space-y-6 mt-4">
@@ -1134,6 +1133,12 @@ function ApiKeyTab() {
           <CardDescription>
             Used for AI-powered transaction enrichment and categorization
           </CardDescription>
+          <div className="mt-2 flex items-start gap-2 rounded-md border border-yellow-500/50 bg-yellow-500/10 p-3 text-sm text-yellow-700 dark:text-yellow-400">
+            <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
+            <span>
+              <strong>Privacy notice:</strong> Your API key is stored server-side and sent to Anthropic for transaction enrichment. Transaction descriptions are temporarily decrypted and sent to the Anthropic API during enrichment. This is an exception to the zero-knowledge model — if you prefer full privacy, do not use this feature.
+            </span>
+          </div>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="space-y-2">

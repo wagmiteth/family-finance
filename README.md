@@ -41,11 +41,14 @@ ALL your data — transactions, categories, settlements, names, API keys
 - Transaction amounts, dates, descriptions, bank details, notes
 - Category names, split types, and split ratios
 - Settlement amounts and who owes whom
-- User names and household names
 - Merchant rule patterns
-- Your Anthropic API key
 
-The server is a pure encrypted storage layer — it cannot read, filter, or validate any user data. All processing (filtering, sorting, settlement calculation, auto-categorization) happens client-side in the browser after decryption.
+**Exceptions to zero-knowledge (plaintext on server):**
+
+- **Invite preview fields** — When creating a household, the creator's name, household name, and avatar are stored in plaintext so the invite page can show who is inviting. These are non-sensitive display hints.
+- **Anthropic API key** — If you opt in to AI enrichment, your API key is stored server-side and transaction descriptions are temporarily sent to the Anthropic API in plaintext. A warning is shown in the UI. Users who prefer full privacy should not use this feature.
+
+Apart from these opt-in exceptions, the server is an encrypted storage layer — it cannot read, filter, or validate any user data. All processing (filtering, sorting, settlement calculation, auto-categorization) happens client-side in the browser after decryption.
 
 ### Key Exchange
 
@@ -67,12 +70,12 @@ All database tables use Supabase Row Level Security (RLS) policies to enforce ho
 
 ## Tech Stack
 
-- **Frontend:** Next.js 15 (App Router), React, TypeScript, Tailwind CSS
+- **Frontend:** Next.js 16 (App Router), React 19, TypeScript, Tailwind CSS
 - **UI Components:** shadcn/ui
 - **Database:** Supabase (PostgreSQL with RLS)
 - **Auth:** Supabase Auth (email/password)
 - **Encryption:** Web Crypto API (AES-GCM, AES-KW, PBKDF2)
-- **AI:** Anthropic Claude API (user-provided key, client-side encrypted)
+- **AI:** Anthropic Claude API (user-provided key, stored server-side — see note below)
 - **Drag & Drop:** dnd-kit
 - **Charts:** Recharts
 

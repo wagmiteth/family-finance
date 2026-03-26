@@ -3,7 +3,7 @@
 A shared household expense tracker built with Next.js and Supabase, featuring strict zero-knowledge encryption inspired by Proton Mail.
 
 ## Tech Stack
-- **Frontend:** Next.js 15 (App Router), React, Tailwind CSS, shadcn/ui
+- **Frontend:** Next.js 16 (App Router), React 19, Tailwind CSS, shadcn/ui
 - **Backend:** Supabase (Auth, PostgreSQL, RLS)
 - **Encryption:** Web Crypto API (client-side AES-GCM 256-bit, zero-knowledge)
 - **AI:** Anthropic Claude API for transaction enrichment
@@ -78,6 +78,27 @@ If both household members forget their passwords, all financial data is **perman
 - `lib/crypto/use-decrypted-fetch.ts` — Hook for fetching + decrypting any entity
 - `lib/crypto/decrypt-transactions.ts` — Transaction-specific decryption
 - `lib/settlements/calculator.ts` — Client-side settlement calculation
+
+## Vercel Deployment
+
+Deployed on Vercel under the `oskar-carlsson` account (oskar.carljohan.carlsson@gmail.com).
+
+**Production URL:** https://family-finance-eight-kappa.vercel.app
+
+### CLI access (for Claude Code)
+
+Token is stored at `~/.vercel-tokens/oskar-carlsson`. Use it to check deployments:
+
+```bash
+VERCEL_TOKEN=$(cat ~/.vercel-tokens/oskar-carlsson) vercel ls --yes
+VERCEL_TOKEN=$(cat ~/.vercel-tokens/oskar-carlsson) vercel inspect <deployment-url>
+VERCEL_TOKEN=$(cat ~/.vercel-tokens/oskar-carlsson) vercel deploy --prod --yes
+```
+
+### Shell aliases (in ~/.zshrc)
+
+- `vc-ff` — Vercel CLI for family-finance (oskar-carlsson account)
+- `vc-wg` — Vercel CLI for legacy projects (wagmit/nsnodes account)
 
 ## Supabase CLI
 
