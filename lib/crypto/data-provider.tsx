@@ -43,6 +43,8 @@ interface DataState {
 interface DataContextValue extends DataState {
   /** Re-fetch and re-decrypt everything */
   refreshAll: () => Promise<void>;
+  /** Re-fetch only the household */
+  refreshHousehold: () => Promise<void>;
   /** Re-fetch only transactions */
   refreshTransactions: () => Promise<void>;
   /** Re-fetch only categories */
@@ -191,6 +193,15 @@ export function DataProvider({ children }: { children: ReactNode }) {
     setState((s) => ({ ...s, ...results, lastFetched: Date.now() }));
   }, [fetchAndDecrypt]);
 
+  const refreshHousehold = useCallback(async () => {
+    const dek = getDEK();
+    const results = await fetchAndDecrypt(
+      { household: "/api/household" },
+      dek
+    );
+    setState((s) => ({ ...s, ...results, lastFetched: Date.now() }));
+  }, [fetchAndDecrypt]);
+
   const refreshCategories = useCallback(async () => {
     const dek = getDEK();
     const results = await fetchAndDecrypt(
@@ -254,6 +265,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
       value={{
         ...state,
         refreshAll,
+        refreshHousehold,
         refreshTransactions,
         refreshCategories,
         refreshSettlements,

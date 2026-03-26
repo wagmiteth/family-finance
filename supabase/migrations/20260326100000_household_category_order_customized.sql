@@ -1,0 +1,2 @@
+ALTER TABLE households
+  ADD COLUMN IF NOT EXISTS category_order_customized BOOLEAN NOT NULL DEFAULT FALSE;

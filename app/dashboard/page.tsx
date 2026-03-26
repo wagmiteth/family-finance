@@ -29,6 +29,7 @@ import {
   Cell,
 } from "recharts";
 import type { Transaction, Category, User, Household } from "@/lib/types";
+import { isDeletedCategory } from "@/lib/categories";
 import { useData } from "@/lib/crypto/data-provider";
 import { InviteBanner } from "@/components/invite-banner";
 
@@ -72,15 +73,19 @@ export default function DashboardPage() {
   const transactions = useMemo(() => {
     const monthStart = startOfMonth(currentMonth);
     const monthEnd = endOfMonth(currentMonth);
+    const deletedCategoryIds = new Set(
+      categories.filter((category) => isDeletedCategory(category)).map((category) => category.id)
+    );
     return data.transactions.filter((t) => {
       if (!t.date) return false;
+      if (t.category_id && deletedCategoryIds.has(t.category_id)) return false;
       try {
         return isWithinInterval(parseISO(t.date), { start: monthStart, end: monthEnd });
       } catch {
         return false;
       }
     });
-  }, [data.transactions, currentMonth]);
+  }, [data.transactions, currentMonth, categories]);
 
   const categoryById = new Map(categories.map((c) => [c.id, c]));
   const sharedCategoryIds = new Set(

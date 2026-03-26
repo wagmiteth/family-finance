@@ -9,6 +9,7 @@ import { getDEK } from "@/lib/crypto/key-store";
 import { generateImportHash, generateLegacyImportHash, txSignature } from "@/lib/transactions/dedup";
 import { hasDEK } from "@/lib/crypto/key-store";
 import { useData } from "@/lib/crypto/data-provider";
+import { isDeletedCategory } from "@/lib/categories";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -176,7 +177,11 @@ export default function UploadPage() {
   const autoCatCount = allTransactions.filter((t) => t.autoCategory).length;
   const categoryMap = useMemo(() => {
     const m = new Map<string, string>();
-    for (const c of categories) m.set(c.id, c.display_name || c.name);
+    for (const c of categories) {
+      if (!isDeletedCategory(c)) {
+        m.set(c.id, c.display_name || c.name);
+      }
+    }
     return m;
   }, [categories]);
 

@@ -142,7 +142,22 @@ export async function PATCH(request: Request) {
         );
       }
 
-      return NextResponse.json({ success: true });
+      const { error: householdError } = await supabase
+        .from("households")
+        .update({ category_order_customized: true })
+        .eq("id", appUser.household_id);
+
+      if (householdError) {
+        console.warn(
+          "[categories PATCH order] category order flag not persisted:",
+          householdError.message
+        );
+      }
+
+      return NextResponse.json({
+        success: true,
+        category_order_customized_persisted: !householdError,
+      });
     }
 
     // Single category update — only server-stored fields

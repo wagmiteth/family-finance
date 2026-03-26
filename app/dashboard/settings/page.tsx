@@ -66,6 +66,9 @@ import type {
   Transaction,
 } from "@/lib/types";
 import { useDecryptedFetch } from "@/lib/crypto/use-decrypted-fetch";
+import { useData } from "@/lib/crypto/data-provider";
+import { setCategoryOrderMarker } from "@/lib/category-order";
+import { excludeDeletedCategory, isDeletedCategory } from "@/lib/categories";
 import { decryptEntity, decryptEntities, encryptCategory, encryptMerchantRule } from "@/lib/crypto/entity-crypto";
 import { getDEK } from "@/lib/crypto/key-store";
 import { InviteBanner } from "@/components/invite-banner";
@@ -205,6 +208,7 @@ function HouseholdTab() {
 
 // --- Categories Tab ---
 function CategoriesTab() {
+  const data = useData();
   const [categories, setCategories] = useState<Category[]>([]);
   const [loading, setLoading] = useState(true);
   const [editCategory, setEditCategory] = useState<Category | null>(null);
@@ -241,6 +245,8 @@ function CategoriesTab() {
   useEffect(() => {
     fetchCategories();
   }, [fetchCategories]);
+
+  const visibleCategories = excludeDeletedCategory(categories);
 
   function openEdit(cat: Category) {
     setEditCategory(cat);
@@ -290,6 +296,7 @@ function CategoriesTab() {
         if (res.ok) {
           toast.success("Category created");
           fetchCategories();
+          void data.refreshCategories();
         } else {
           toast.error("Failed to create category");
         }
@@ -306,6 +313,7 @@ function CategoriesTab() {
         if (res.ok) {
           toast.success("Category updated");
           fetchCategories();
+          void data.refreshCategories();
         } else {
           toast.error("Failed to update category");
         }
@@ -324,6 +332,7 @@ function CategoriesTab() {
       if (res.ok) {
         toast.success("Category deleted");
         fetchCategories();
+        void data.refreshCategories();
       } else {
         const data = await res.json();
         toast.error(data.error || "Failed to delete category");
@@ -334,19 +343,23 @@ function CategoriesTab() {
   }
 
   async function handleMoveCategory(index: number, direction: "up" | "down") {
+    const sourceCategories = visibleCategories;
     const swapIndex = direction === "up" ? index - 1 : index + 1;
-    if (swapIndex < 0 || swapIndex >= categories.length) return;
+    if (swapIndex < 0 || swapIndex >= sourceCategories.length) return;
 
     setReordering(true);
-    const newCategories = [...categories];
+    const newCategories = [...sourceCategories];
     [newCategories[index], newCategories[swapIndex]] = [
       newCategories[swapIndex],
       newCategories[index],
     ];
 
-    setCategories(newCategories);
+    const hiddenCategories = categories.filter((category) =>
+      isDeletedCategory(category)
+    );
+    setCategories([...newCategories, ...hiddenCategories]);
 
-    const orderPayload = newCategories.map((c, i) => ({
+    const orderPayload = [...newCategories, ...hiddenCategories].map((c, i) => ({
       id: c.id,
       sort_order: i,
     }));
@@ -360,6 +373,11 @@ function CategoriesTab() {
       if (!res.ok) {
         toast.error("Failed to reorder categories");
         fetchCategories();
+      } else {
+        if (data.household?.id) {
+          setCategoryOrderMarker(data.household.id);
+        }
+        await Promise.all([data.refreshCategories(), data.refreshHousehold()]);
       }
     } catch {
       toast.error("Failed to reorder categories");
@@ -396,7 +414,7 @@ function CategoriesTab() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {categories.map((cat, index) => (
+              {visibleCategories.map((cat, index) => (
                 <TableRow key={cat.id}>
                   <TableCell>
                     <div className="flex items-center gap-0.5">
@@ -415,7 +433,7 @@ function CategoriesTab() {
                         className="h-6 w-6"
                         onClick={() => handleMoveCategory(index, "down")}
                         disabled={
-                          index === categories.length - 1 || reordering
+                          index === visibleCategories.length - 1 || reordering
                         }
                       >
                         <ArrowDown className="h-3 w-3" />
@@ -774,10 +792,15 @@ function MerchantRulesTab() {
     fetchData();
   }, [fetchData]);
 
+  const selectableCategories = excludeDeletedCategory(categories);
+
   function openEdit(rule: MerchantRule) {
     setEditRule(rule);
     setEditPattern(rule.pattern);
-    setEditCategoryId(rule.category_id || "");
+    const selectedCategory = selectableCategories.find(
+      (category) => category.id === rule.category_id
+    );
+    setEditCategoryId(selectedCategory?.id || "");
     setEditMatchTransactionType(rule.match_transaction_type || "");
     setDialogOpen(true);
   }
@@ -837,7 +860,7 @@ function MerchantRulesTab() {
     }
   }
 
-  const categoryMap = new Map(categories.map((c) => [c.id, c]));
+  const categoryMap = new Map(selectableCategories.map((c) => [c.id, c]));
   const autoImportRules = rules.filter((r) => r.rule_type === "auto_import");
   const patternRules = rules.filter((r) => r.rule_type === "pattern");
 
@@ -884,7 +907,7 @@ function MerchantRulesTab() {
                       </TableCell>
                       <TableCell>
                         {rule.category_id
-                          ? categoryMap.get(rule.category_id)?.display_name || "Unknown"
+                          ? categoryMap.get(rule.category_id)?.display_name || "—"
                           : "—"}
                       </TableCell>
                       <TableCell>{rule.priority}</TableCell>
@@ -946,7 +969,7 @@ function MerchantRulesTab() {
                       </TableCell>
                       <TableCell>
                         {rule.category_id
-                          ? categoryMap.get(rule.category_id)?.display_name || "Unknown"
+                          ? categoryMap.get(rule.category_id)?.display_name || "—"
                           : "—"}
                       </TableCell>
                       <TableCell>{rule.priority}</TableCell>
@@ -1023,7 +1046,7 @@ function MerchantRulesTab() {
                   </SelectValue>
                 </SelectTrigger>
                 <SelectContent>
-                  {categories.map((c) => (
+                  {selectableCategories.map((c) => (
                     <SelectItem key={c.id} value={c.id}>
                       {c.display_name}
                     </SelectItem>
