@@ -285,7 +285,12 @@ function TransactionCard({
                 Settled
               </Badge>
             )}
-            {transaction.bank_name && (
+            {transaction.enriched_info && (
+              <span className="text-[10px] text-amber-600 dark:text-amber-400">
+                · {transaction.enriched_info}
+              </span>
+            )}
+            {transaction.bank_name && !transaction.enriched_info && (
               <span className="text-[10px] text-muted-foreground/70">
                 · {transaction.bank_name}
               </span>
@@ -1227,7 +1232,7 @@ export default function TransactionsPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           transactionIds: [tx.id],
-          descriptions: [{ id: tx.id, name: tx.description }],
+          descriptions: [{ id: tx.id, name: tx.description, amount: tx.amount }],
         }),
       });
 
@@ -1246,6 +1251,7 @@ export default function TransactionsPage() {
           enriched_info: result.merchant_type ?? tx.enriched_info,
           enriched_description: result.merchant_description ?? tx.enriched_description,
           enriched_address: result.merchant_address ?? tx.enriched_address,
+          enriched_at: new Date().toISOString(),
         };
 
         // Encrypt and save back to server

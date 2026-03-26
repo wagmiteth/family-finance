@@ -1183,7 +1183,7 @@ export default function SettlementsPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           transactionIds: [transaction.id],
-          descriptions: [{ id: transaction.id, name: transaction.description }],
+          descriptions: [{ id: transaction.id, name: transaction.description, amount: transaction.amount }],
         }),
       });
 
@@ -1206,6 +1206,7 @@ export default function SettlementsPage() {
         enriched_info: result.merchant_type ?? transaction.enriched_info,
         enriched_description: result.merchant_description ?? transaction.enriched_description,
         enriched_address: result.merchant_address ?? transaction.enriched_address,
+        enriched_at: new Date().toISOString(),
       };
 
       // Encrypt and save back to server

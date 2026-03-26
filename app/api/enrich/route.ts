@@ -73,7 +73,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const items = descriptions as { id: string; name: string }[];
+    const items = descriptions as { id: string; name: string; amount?: number }[];
 
     const anthropic = new Anthropic({ apiKey });
 
@@ -83,16 +83,18 @@ export async function POST(request: Request) {
       messages: [
         {
           role: "user",
-          content: `You are given bank transaction names. For each one, identify what company or merchant it is and provide:
-- merchant_name: The clean, human-readable company/merchant name
-- merchant_type: A short category label (e.g. "cloud hosting", "grocery store", "streaming service", "restaurant", "telecom", "insurance")
-- merchant_description: 1-2 sentences about what this company is and what they do. Be specific and informative.
-- merchant_address: Their headquarters city/country if you know it, otherwise null
+          content: `You are an expert at identifying merchants from bank transaction descriptions. These are Swedish bank transactions (amounts in SEK). For each transaction, identify the company/merchant and provide detailed information.
+
+Return these fields for each transaction:
+- merchant_name: The clean, human-readable company/merchant name (e.g. "Spotify" not "SPOTIFY AB")
+- merchant_type: A specific category (e.g. "music streaming", "grocery store", "fast food restaurant", "cloud hosting provider", "public transit", "pharmacy", "home insurance", "mobile carrier", "coworking space", "SaaS / developer tools")
+- merchant_description: 2-3 sentences. What the company does, what they're known for, when they were founded, and any notable details. Be specific — e.g. "Spotify is a Swedish music and podcast streaming service founded in 2006 by Daniel Ek and Martin Lorentzon. It is the world's largest audio streaming platform with over 600 million users." NOT just "A streaming service."
+- merchant_address: The company's headquarters or primary location as "City, Country" (e.g. "Stockholm, Sweden"). If the transaction looks like a local store/restaurant, give the likely city. Use null only if truly unknown.
 
 Transactions:
-${items.map((t) => `- id: ${t.id}, name: "${t.name}"`).join("\n")}
+${items.map((t) => `- id: ${t.id}, name: "${t.name}"${t.amount != null ? `, amount: ${t.amount} SEK` : ""}`).join("\n")}
 
-Respond with ONLY a JSON array, no markdown, no code fences, no explanation. Example:
+Respond with ONLY a valid JSON array. No markdown, no code fences, no explanation.
 [{"id":"...","merchant_name":"...","merchant_type":"...","merchant_description":"...","merchant_address":"..."}]`,
         },
       ],
