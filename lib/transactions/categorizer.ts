@@ -32,35 +32,23 @@ function matchPatternRule(
 }
 
 /**
- * Auto-categorize during import. Checks both auto_import rules (transaction_type matching)
- * and pattern rules (description matching). Auto-import rules are evaluated first.
+ * Auto-categorize during import. Only checks auto_import rules (transaction_type matching).
+ * Pattern rules are applied separately via manual "Auto-sort" on the transactions page.
  */
 export function autoCategorizeImport(
-  description: string,
-  amount: number,
   transactionType: string | null,
   rules: MerchantRule[]
 ): string | null {
-  const sortedRules = [...rules].sort((a, b) => b.priority - a.priority);
+  const autoImportRules = rules
+    .filter((r) => r.rule_type === "auto_import")
+    .sort((a, b) => b.priority - a.priority);
 
-  // First pass: auto_import rules (match on transaction_type)
-  for (const rule of sortedRules) {
-    if (rule.rule_type !== "auto_import") continue;
-
+  for (const rule of autoImportRules) {
     if (
       rule.match_transaction_type &&
       transactionType &&
       transactionType.toLowerCase() === rule.match_transaction_type.toLowerCase()
     ) {
-      return rule.category_id;
-    }
-  }
-
-  // Second pass: pattern rules (match on description)
-  for (const rule of sortedRules) {
-    if (rule.rule_type !== "pattern") continue;
-
-    if (matchPatternRule(rule, description, amount)) {
       return rule.category_id;
     }
   }

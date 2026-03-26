@@ -321,8 +321,6 @@ export default function UploadPage() {
           autoCategory:
             t.autoCategory ??
             autoCategorizeImport(
-              t.description || "",
-              t.amount,
               t.transaction_type || null,
               merchantRules
             ),
@@ -532,8 +530,6 @@ export default function UploadPage() {
             for (const t of result.transactions) {
               if (!t.autoCategory) {
                 t.autoCategory = autoCategorizeImport(
-                  t.description || "",
-                  t.amount,
                   t.transaction_type || null,
                   rules
                 );
