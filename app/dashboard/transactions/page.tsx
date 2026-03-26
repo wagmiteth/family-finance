@@ -57,6 +57,8 @@ import { toast } from "sonner";
 import type { Transaction, Category, User, MerchantRule, Settlement } from "@/lib/types";
 import { encryptMerchantRule, encryptTransaction } from "@/lib/crypto/entity-crypto";
 import { useData } from "@/lib/crypto/data-provider";
+import { hasCategoryOrderMarker, setCategoryOrderMarker } from "@/lib/category-order";
+import { SETTLEMENT_TRANSACTION_TYPE } from "@/lib/settlements/calculator";
 import { TransactionDetailDialog } from "@/components/transaction-detail-dialog";
 
 function formatCurrency(amount: number) {
@@ -615,8 +617,9 @@ function getSmartColumnOrder(
   currentUserId: string | null
 ): Category[] {
   // Always apply smart default ordering per viewer:
-  // Uncategorized, other user's cats, Shared, current user's cats, Exclude
-  // This way you review the other person's spending first, then shared, then your own.
+  // Uncategorized, Exclude, current user's cats, Shared, other user's cats
+  // This keeps your main working categories first while still surfacing the
+  // other household member's private categories afterward.
   const uncategorized = categories.filter((c) => c.name === "uncategorized");
   const shared = categories.filter((c) => c.name === "shared");
   const exclude = categories.filter((c) => c.name === "exclude");
@@ -645,10 +648,10 @@ function getSmartColumnOrder(
 
   return [
     ...uncategorized,
-    ...otherUserCats.sort((a, b) => a.sort_order - b.sort_order),
-    ...shared,
-    ...currentUserCats.sort((a, b) => a.sort_order - b.sort_order),
     ...exclude,
+    ...currentUserCats.sort((a, b) => a.sort_order - b.sort_order),
+    ...shared,
+    ...otherUserCats.sort((a, b) => a.sort_order - b.sort_order),
     ...otherCats.sort((a, b) => a.sort_order - b.sort_order),
   ];
 }
@@ -699,6 +702,9 @@ export default function TransactionsPage() {
   const categories = data.categories;
   const users = data.users;
   const currentUser = data.currentUser;
+  const householdId = data.household?.id ?? null;
+  const categoryOrderCustomized =
+    data.household?.category_order_customized ?? false;
   const merchantRules = data.merchantRules;
   const settledTransactionIds = getSettledTransactionIds(data.settlements);
   const loading = data.loading && data.lastFetched === 0;
@@ -710,6 +716,7 @@ export default function TransactionsPage() {
   const [overColumnId, setOverColumnId] = useState<string | null>(null);
   const [detailTransaction, setDetailTransaction] = useState<Transaction | null>(null);
   const [enriching, setEnriching] = useState(false);
+  const [settlementToggling, setSettlementToggling] = useState(false);
   const [autoSorting, setAutoSorting] = useState(false);
   const [columnOrder, setColumnOrder] = useState<string[]>([]);
   const draggingColumnIdRef = useRef<string | null>(null);
@@ -766,29 +773,23 @@ export default function TransactionsPage() {
     await data.refreshTransactions();
   }, [data]);
 
-  // Compute smart column order when categories or current user changes
-  // Per-user column order is stored in localStorage
+  // Compute the visible column order from the shared household order mode.
+  // Before anyone customizes the order, we use the viewer-specific smart
+  // default. After a reorder in Settings or on this page, the DB sort_order
+  // becomes the single source of truth for everyone in the household.
   useEffect(() => {
     if (categories.length > 0 && currentUser?.id) {
-      const storageKey = `tx-col-order:${currentUser.id}`;
-      const saved = localStorage.getItem(storageKey);
-      if (saved) {
-        try {
-          const savedOrder = JSON.parse(saved) as string[];
-          // Validate saved IDs still exist, append any new categories
-          const catIds = new Set(categories.filter((c) => c.name !== "deleted").map((c) => c.id));
-          const valid = savedOrder.filter((id) => catIds.has(id));
-          const missing = [...catIds].filter((id) => !valid.includes(id));
-          if (valid.length > 0) {
-            setColumnOrder([...valid, ...missing]);
-            return;
-          }
-        } catch { /* fall through to smart default */ }
-      }
-      const ordered = getSmartColumnOrder(categories, currentUser.id);
+      const useSharedOrder =
+        categoryOrderCustomized ||
+        (householdId ? hasCategoryOrderMarker(householdId) : false);
+      const ordered = useSharedOrder
+        ? categories.filter((c) => c.name !== "deleted")
+        : getSmartColumnOrder(categories, currentUser.id).filter(
+            (c) => c.name !== "deleted"
+          );
       setColumnOrder(ordered.map((c) => c.id));
     }
-  }, [categories, currentUser?.id]);
+  }, [categories, currentUser?.id, categoryOrderCustomized, householdId]);
 
   const filteredTransactions = useMemo(() => {
     const base = userFilter === "all"
@@ -805,10 +806,13 @@ export default function TransactionsPage() {
 
   const uncategorizedCat = categories.find((c) => c.name === "uncategorized");
 
-  // Build columns from columnOrder
-  const columns = columnOrder
+  // Build the current viewer-specific category order from columnOrder
+  const orderedCategories = columnOrder
     .map((id) => categories.find((c) => c.id === id))
-    .filter((c): c is Category => c !== undefined)
+    .filter((c): c is Category => c !== undefined);
+
+  // Build columns from the ordered categories
+  const columns = orderedCategories
     .map((c) => ({
       id: c.id,
       display_name: c.display_name,
@@ -948,9 +952,36 @@ export default function TransactionsPage() {
       const newOrder = arrayMove(columnOrder, oldIndex, newIndex);
       setColumnOrder(newOrder);
 
-      // Persist per-user column order in localStorage
-      if (currentUser?.id) {
-        localStorage.setItem(`tx-col-order:${currentUser.id}`, JSON.stringify(newOrder));
+      const deletedIds = categories
+        .filter((c) => c.name === "deleted")
+        .sort((a, b) => a.sort_order - b.sort_order)
+        .map((c) => c.id);
+
+      const orderPayload = [...newOrder, ...deletedIds].map((id, index) => ({
+        id,
+        sort_order: index,
+      }));
+
+      try {
+        const res = await fetch("/api/categories", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ order: orderPayload }),
+        });
+
+        if (!res.ok) {
+          toast.error("Failed to save category order");
+          await Promise.all([data.refreshCategories(), data.refreshHousehold()]);
+          return;
+        }
+
+        if (householdId) {
+          setCategoryOrderMarker(householdId);
+        }
+        await Promise.all([data.refreshCategories(), data.refreshHousehold()]);
+      } catch {
+        toast.error("Failed to save category order");
+        await Promise.all([data.refreshCategories(), data.refreshHousehold()]);
       }
 
       return;
@@ -1290,6 +1321,52 @@ export default function TransactionsPage() {
     );
   }
 
+  async function handleToggleSettlement(transaction: Transaction) {
+    const isCurrentlySettlement =
+      transaction.transaction_type === SETTLEMENT_TRANSACTION_TYPE;
+
+    if (!isCurrentlySettlement && transaction.amount < 0.01) {
+      toast.error("Only positive (incoming) transactions can be settlement payments");
+      return;
+    }
+
+    setSettlementToggling(true);
+    try {
+
+      const updated: Transaction = isCurrentlySettlement
+        ? { ...transaction, transaction_type: null, payment_allocations: null }
+        : { ...transaction, transaction_type: SETTLEMENT_TRANSACTION_TYPE, payment_allocations: null };
+
+      const encrypted_data = await encryptTransaction(
+        updated as unknown as Record<string, unknown>
+      );
+      const res = await fetch(`/api/transactions/${transaction.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ encrypted_data }),
+      });
+
+      if (!res.ok) {
+        toast.error("Failed to update transaction");
+        return;
+      }
+
+      handleUpdateTransaction(updated);
+      if (isCurrentlySettlement) {
+        toast.success("Transaction unmarked as settlement payment");
+      } else {
+        toast.success(
+          "Marked as settlement payment. Use Record Payment on the Settlements page to allocate it across months.",
+          { duration: 5000 }
+        );
+      }
+    } catch {
+      toast.error("Failed to update transaction");
+    } finally {
+      setSettlementToggling(false);
+    }
+  }
+
   async function handleCardChangeUser(transactionId: string, userId: string) {
     const ids = selectedIds.has(transactionId) ? Array.from(selectedIds) : [transactionId];
     const { mutableIds, frozenCount } = splitMutableTransactionIds(
@@ -1567,7 +1644,7 @@ export default function TransactionsPage() {
                 <CategoryColumn
                   key={col.id}
                   category={col}
-                  categories={categories}
+                  categories={orderedCategories}
                   transactions={getColumnTransactions(col.id)}
                   users={users}
                   settledTransactionIds={settledTransactionIds}
@@ -1615,6 +1692,8 @@ export default function TransactionsPage() {
         onClose={() => setDetailTransaction(null)}
         onEnrich={handleEnrich}
         onUpdate={handleUpdateTransaction}
+        onToggleSettlement={handleToggleSettlement}
+        settlementToggling={settlementToggling}
       />
     </div>
   );

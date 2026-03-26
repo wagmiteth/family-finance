@@ -9,6 +9,7 @@ export interface Household {
   id: string;
   name: string; // encrypted
   invite_code: string | null;
+  category_order_customized: boolean;
   created_at: string;
 }
 
@@ -57,6 +58,7 @@ export interface Transaction {
   enriched_description: string | null; // encrypted
   enriched_address: string | null; // encrypted
   enriched_at: string | null; // encrypted
+  payment_allocations: PaymentAllocation[] | null; // encrypted
   import_hash: string;
   batch_id: string | null;
   created_at: string;
@@ -78,6 +80,12 @@ export interface MerchantRule {
   match_transaction_type: string | null; // encrypted
   notes: string | null; // encrypted
   created_at: string;
+}
+
+export interface PaymentAllocation {
+  month: string;
+  amount: number;
+  settlement_id?: string;
 }
 
 export interface SettlementTransactionSnapshot {
@@ -108,6 +116,13 @@ export interface SettlementCategorySummary {
   owesByUser: Record<string, number>;
 }
 
+export interface SettlementPaymentRef {
+  transaction_id: string;
+  amount: number;
+  date: string;
+  partial: boolean;
+}
+
 export interface SettlementBatch {
   id: string;
   settled_at: string;
@@ -118,6 +133,7 @@ export interface SettlementBatch {
   users: SettlementUserSummary[];
   categories: SettlementCategorySummary[];
   transactions: SettlementTransactionSnapshot[];
+  payment_refs?: SettlementPaymentRef[];
 }
 
 export interface Settlement {
@@ -188,6 +204,7 @@ export interface RawHousehold {
   invite_code: string | null;
   encrypted_dek: string | null;
   invite_code_salt: string | null;
+  category_order_customized: boolean;
   encrypted_data: string | null;
   created_at: string;
 }

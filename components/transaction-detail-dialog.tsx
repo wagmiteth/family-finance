@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, type ReactNode } from "react";
-import { Loader2, Sparkles } from "lucide-react";
+import { Banknote, Loader2, Sparkles, Undo2 } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -14,6 +14,8 @@ import {
 } from "@/components/ui/dialog";
 import { Separator } from "@/components/ui/separator";
 import { encryptTransaction } from "@/lib/crypto/entity-crypto";
+import { excludeDeletedCategory } from "@/lib/categories";
+import { SETTLEMENT_TRANSACTION_TYPE } from "@/lib/settlements/calculator";
 import type { Category, Transaction, User } from "@/lib/types";
 
 function formatCurrency(amount: number) {
@@ -59,6 +61,9 @@ interface TransactionDetailDialogProps {
   onClose: () => void;
   onEnrich: (transaction: Transaction) => void;
   onUpdate: (transaction: Transaction) => void;
+  /** If provided, shows a "Mark as Settlement Payment" / "Unmark" action */
+  onToggleSettlement?: (transaction: Transaction) => void;
+  settlementToggling?: boolean;
 }
 
 export function TransactionDetailDialog({
@@ -70,17 +75,23 @@ export function TransactionDetailDialog({
   onClose,
   onEnrich,
   onUpdate,
+  onToggleSettlement,
+  settlementToggling,
 }: TransactionDetailDialogProps) {
   const [notes, setNotes] = useState("");
   const [savingNotes, setSavingNotes] = useState(false);
   const [selectedCategoryId, setSelectedCategoryId] = useState("");
+  const selectableCategories = excludeDeletedCategory(categories);
 
   useEffect(() => {
     if (transaction) {
       setNotes(transaction.notes || "");
-      setSelectedCategoryId(transaction.category_id || "");
+      const selectedCategory = selectableCategories.find(
+        (category) => category.id === transaction.category_id
+      );
+      setSelectedCategoryId(selectedCategory?.id || "");
     }
-  }, [transaction]);
+  }, [transaction, selectableCategories]);
 
   if (!transaction) return null;
 
@@ -242,6 +253,60 @@ export function TransactionDetailDialog({
             </Button>
           )}
 
+          {onToggleSettlement && !isFrozen && (
+            currentTransaction.transaction_type === SETTLEMENT_TRANSACTION_TYPE ? (
+              /* Already marked — always show unmark UI */
+              <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 dark:border-emerald-900 dark:bg-emerald-950/30">
+                <div className="flex items-center gap-2 text-sm font-medium text-emerald-800 dark:text-emerald-300">
+                  <Banknote className="h-4 w-4" />
+                  Settlement Payment
+                </div>
+                <p className="mt-1 text-xs text-emerald-700 dark:text-emerald-400">
+                  This transaction is marked as a settlement payment and is excluded from expense calculations.
+                </p>
+                {currentTransaction.payment_allocations && currentTransaction.payment_allocations.length > 0 && (
+                  <div className="mt-2 space-y-1">
+                    {currentTransaction.payment_allocations.map((alloc) => (
+                      <div key={alloc.month} className="flex items-center justify-between text-xs text-emerald-700 dark:text-emerald-400">
+                        <span>{alloc.month}</span>
+                        <span className="font-mono">{formatCurrency(alloc.amount)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="mt-3 w-full"
+                  onClick={() => onToggleSettlement(currentTransaction)}
+                  disabled={settlementToggling}
+                >
+                  {settlementToggling ? (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  ) : (
+                    <Undo2 className="mr-2 h-4 w-4" />
+                  )}
+                  Unmark as Settlement Payment
+                </Button>
+              </div>
+            ) : currentTransaction.amount > 0 ? (
+              /* Only positive (incoming) transactions can be marked as settlement payments */
+              <Button
+                variant="outline"
+                className="w-full border-emerald-200 text-emerald-800 hover:bg-emerald-50 dark:border-emerald-900 dark:text-emerald-300 dark:hover:bg-emerald-950/30"
+                onClick={() => onToggleSettlement(currentTransaction)}
+                disabled={settlementToggling}
+              >
+                {settlementToggling ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <Banknote className="mr-2 h-4 w-4" />
+                )}
+                Mark as Settlement Payment
+              </Button>
+            ) : null
+          )}
+
           <Separator />
 
           <div className="space-y-2">
@@ -256,7 +321,7 @@ export function TransactionDetailDialog({
                   disabled={isFrozen}
                 >
                   <option value="">Uncategorized</option>
-                  {categories.map((category) => (
+                  {selectableCategories.map((category) => (
                     <option key={category.id} value={category.id}>
                       {category.display_name}
                     </option>

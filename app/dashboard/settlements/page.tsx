@@ -5,6 +5,7 @@ import { endOfMonth, format, isWithinInterval, parseISO, startOfMonth } from "da
 import {
   AlertTriangle,
   ArrowRight,
+  Banknote,
   Check,
   ChevronDown,
   ChevronUp,
@@ -16,19 +17,34 @@ import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Separator } from "@/components/ui/separator";
 import { TransactionDetailDialog } from "@/components/transaction-detail-dialog";
 import { useData } from "@/lib/crypto/data-provider";
 import { encryptSettlement, encryptTransaction } from "@/lib/crypto/entity-crypto";
 import {
   buildSettlementBreakdown,
+  isSettlementPayment,
+  SETTLEMENT_TRANSACTION_TYPE,
   type SettlementBreakdown,
   type SettlementTransfer,
   generateSettlementHash,
   getSettlementParticipants,
 } from "@/lib/settlements/calculator";
+import {
+  allocatePayment,
+  getPaymentsAppliedToMonth,
+  type UnsettledMonth,
+} from "@/lib/settlements/allocator";
 import type {
   Category,
+  PaymentAllocation,
   Settlement,
   SettlementBatch,
   SettlementTransactionSnapshot,
@@ -46,6 +62,10 @@ interface MonthlySettlementView {
   settledBatches: SettlementBatch[];
   uncategorizedCount: number;
   uncategorizedAmount: number;
+  /** Total settlement payments already applied to this month via FIFO */
+  paymentsApplied: number;
+  /** Remaining owed after subtracting paymentsApplied */
+  remainingOwed: number;
 }
 
 interface SettlementDetailState {
@@ -360,8 +380,10 @@ function buildMonthlySettlementViews(
 
   return [...months]
     .map((month) => {
-      const monthTransactions = transactions.filter((transaction) =>
-        isTransactionInMonth(transaction, month)
+      const monthTransactions = transactions.filter(
+        (transaction) =>
+          isTransactionInMonth(transaction, month) &&
+          !isSettlementPayment(transaction)
       );
       const monthTotal = buildSettlementBreakdown(
         monthTransactions,
@@ -390,9 +412,14 @@ function buildMonthlySettlementViews(
       );
       const uncategorizedTransactions = monthTransactions.filter(
         (transaction) =>
-          !transaction.category_id ||
-          uncategorizedCategoryIds.has(transaction.category_id)
+          !isSettlementPayment(transaction) &&
+          (!transaction.category_id ||
+            uncategorizedCategoryIds.has(transaction.category_id))
       );
+
+      const paymentsApplied = getPaymentsAppliedToMonth(month, transactions);
+      const pendingOwed = pending.transfer.amount;
+      const remainingOwed = Math.max(0, Math.round((pendingOwed - paymentsApplied) * 100) / 100);
 
       return {
         month,
@@ -406,6 +433,8 @@ function buildMonthlySettlementViews(
           (sum, transaction) => sum + Math.abs(transaction.amount),
           0
         ),
+        paymentsApplied,
+        remainingOwed,
       } satisfies MonthlySettlementView;
     })
     .filter(
@@ -956,9 +985,9 @@ function SettlementCard({
               </p>
             </div>
             <div className="rounded-lg bg-background/80 px-3 py-3">
-              <p className="text-xs text-muted-foreground">Open batch transfer</p>
+              <p className="text-xs text-muted-foreground">Remaining owed</p>
               <p className="mt-1 font-mono font-semibold">
-                {formatCurrency(view.pending.transfer.amount)}
+                {formatCurrency(view.remainingOwed)}
               </p>
             </div>
           </div>
@@ -999,6 +1028,29 @@ function SettlementCard({
               ? `${view.pending.transactionCount} transactions are waiting to be settled as the next batch.`
               : "Newly imported transactions in this month will appear here as a separate batch."}
           </p>
+
+          {view.paymentsApplied > 0.01 && (
+            <div className="mt-3 rounded-lg bg-emerald-50/80 px-3 py-2 dark:bg-emerald-950/20">
+              <div className="flex items-center justify-between text-sm">
+                <span className="flex items-center gap-1.5 font-medium text-emerald-800 dark:text-emerald-300">
+                  <Banknote className="h-3.5 w-3.5" />
+                  Payments applied
+                </span>
+                <span className="font-mono font-semibold text-emerald-800 dark:text-emerald-300">
+                  {formatCurrency(view.paymentsApplied)}
+                </span>
+              </div>
+              {view.remainingOwed > 0.01 ? (
+                <p className="mt-1 text-xs text-emerald-700 dark:text-emerald-400">
+                  {formatCurrency(view.remainingOwed)} still remaining
+                </p>
+              ) : (
+                <p className="mt-1 text-xs text-emerald-700 dark:text-emerald-400">
+                  This month is fully paid
+                </p>
+              )}
+            </div>
+          )}
         </div>
 
         <div className="mt-4 flex flex-wrap items-center gap-2">
@@ -1090,6 +1142,316 @@ function SettlementCard({
   );
 }
 
+function SettlementPaymentsPanel({
+  transactions,
+  users,
+  hasOutstanding,
+  onRecordPayment,
+  onOpenTransaction,
+}: {
+  transactions: Transaction[];
+  users: User[];
+  hasOutstanding: boolean;
+  onRecordPayment: () => void;
+  onOpenTransaction: (transaction: Transaction) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+
+  const settlementPayments = transactions
+    .filter((tx) => tx.transaction_type === SETTLEMENT_TRANSACTION_TYPE)
+    .sort((a, b) => b.date.localeCompare(a.date));
+
+  const totalPaid = settlementPayments.reduce(
+    (sum, tx) => sum + Math.abs(tx.amount),
+    0
+  );
+
+  return (
+    <div className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50/70 px-5 py-4 dark:border-emerald-900 dark:bg-emerald-950/20">
+      <div className="flex items-start gap-4">
+        <div className="flex-1">
+          <div className="flex items-center gap-2">
+            <Banknote className="h-4 w-4 text-emerald-700 dark:text-emerald-400" />
+            <p className="text-sm font-semibold text-emerald-900 dark:text-emerald-200">
+              Settlement Payments
+            </p>
+          </div>
+          {hasOutstanding ? (
+            <p className="mt-0.5 text-xs text-emerald-700 dark:text-emerald-400">
+              Mark an incoming transfer as a settlement payment to track it against outstanding months.
+            </p>
+          ) : (
+            <p className="mt-0.5 text-xs text-emerald-700 dark:text-emerald-400">
+              All months are currently settled. Record a payment when new expenses arise.
+            </p>
+          )}
+        </div>
+        <Button
+          onClick={onRecordPayment}
+          size="sm"
+          className="shrink-0 bg-emerald-700 text-white hover:bg-emerald-800 dark:bg-emerald-600 dark:hover:bg-emerald-700"
+        >
+          <Banknote className="mr-2 h-4 w-4" />
+          Record Payment
+        </Button>
+      </div>
+
+      {settlementPayments.length > 0 && (
+        <div className="mt-3">
+          <button
+            type="button"
+            onClick={() => setExpanded((c) => !c)}
+            className="flex w-full items-center justify-between rounded-lg bg-emerald-100/70 px-3 py-2 text-sm transition-colors hover:bg-emerald-100 dark:bg-emerald-900/30 dark:hover:bg-emerald-900/50"
+          >
+            <span className="font-medium text-emerald-800 dark:text-emerald-300">
+              {settlementPayments.length} payment
+              {settlementPayments.length === 1 ? "" : "s"} recorded
+              <span className="ml-2 font-mono">
+                ({formatCurrency(totalPaid)} total)
+              </span>
+            </span>
+            {expanded ? (
+              <ChevronUp className="h-4 w-4 text-emerald-700 dark:text-emerald-400" />
+            ) : (
+              <ChevronDown className="h-4 w-4 text-emerald-700 dark:text-emerald-400" />
+            )}
+          </button>
+
+          {expanded && (
+            <div className="mt-2 space-y-1.5">
+              {settlementPayments.map((tx) => {
+                const payer = users.find((u) => u.id === tx.user_id);
+                const allocCount = tx.payment_allocations?.length ?? 0;
+
+                return (
+                  <button
+                    key={tx.id}
+                    type="button"
+                    onClick={() => onOpenTransaction(tx)}
+                    className="w-full rounded-lg border border-emerald-200 bg-white px-3 py-2.5 text-left text-sm transition-colors hover:border-emerald-400 hover:bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950/30 dark:hover:border-emerald-600 dark:hover:bg-emerald-950/50"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                          <span className="font-mono">
+                            {formatTransactionDate(tx.date)}
+                          </span>
+                          {payer && <span>{payer.name}</span>}
+                          {allocCount > 0 && (
+                            <Badge
+                              variant="outline"
+                              className="h-4 border-emerald-300 px-1 text-[9px] text-emerald-700 dark:border-emerald-700 dark:text-emerald-400"
+                            >
+                              {allocCount} month{allocCount === 1 ? "" : "s"}
+                            </Badge>
+                          )}
+                        </div>
+                        <p className="mt-1 truncate font-medium">
+                          {tx.enriched_name || tx.description}
+                        </p>
+                        {tx.payment_allocations && tx.payment_allocations.length > 0 && (
+                          <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-emerald-700 dark:text-emerald-400">
+                            {tx.payment_allocations.map((alloc) => (
+                              <span key={alloc.month} className="font-mono">
+                                {alloc.month}: {formatCurrency(alloc.amount)}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <span className="shrink-0 font-mono font-semibold text-emerald-800 dark:text-emerald-300">
+                        {formatCurrency(tx.amount)}
+                      </span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SettlementPaymentDialog({
+  open,
+  onClose,
+  transactions,
+  monthlyViews,
+  participants,
+  onConfirm,
+  busy,
+}: {
+  open: boolean;
+  onClose: () => void;
+  transactions: Transaction[];
+  monthlyViews: MonthlySettlementView[];
+  participants: [User, User];
+  onConfirm: (transaction: Transaction, allocations: PaymentAllocation[]) => Promise<void>;
+  busy: boolean;
+}) {
+  const [selectedTxId, setSelectedTxId] = useState<string>("");
+  const [customAmount, setCustomAmount] = useState<string>("");
+
+  // Find candidate transactions: positive amounts (incoming transfers) that aren't already marked as settlement
+  const candidates = transactions.filter(
+    (tx) =>
+      tx.amount > 0 &&
+      tx.transaction_type !== SETTLEMENT_TRANSACTION_TYPE
+  ).sort((a, b) => b.date.localeCompare(a.date));
+
+  const selectedTx = candidates.find((tx) => tx.id === selectedTxId) ?? null;
+  const paymentAmount = customAmount
+    ? parseFloat(customAmount)
+    : selectedTx?.amount ?? 0;
+
+  // Build unsettled months from views where pending transfer has a direction
+  const unsettledMonths: UnsettledMonth[] = monthlyViews
+    .filter((view) => view.remainingOwed > 0.01 && view.pending.transfer.fromUserId)
+    .map((view) => ({
+      month: view.month,
+      owed: view.remainingOwed,
+      settlement: view.record,
+      breakdown: view.pending,
+    }));
+
+  const allocation = paymentAmount > 0
+    ? allocatePayment(paymentAmount, unsettledMonths)
+    : { allocations: [], overpayment: 0 };
+
+  return (
+    <Dialog open={open} onOpenChange={(isOpen) => !isOpen && onClose()}>
+      <DialogContent className="max-h-[85vh] max-w-lg overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle>Record Settlement Payment</DialogTitle>
+          <DialogDescription>
+            Select an incoming transfer to mark as a settlement payment. The amount will be
+            applied to the oldest unsettled months first.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-4">
+          <div>
+            <label className="text-sm font-medium">Select transaction</label>
+            <select
+              value={selectedTxId}
+              onChange={(e) => {
+                setSelectedTxId(e.target.value);
+                setCustomAmount("");
+              }}
+              aria-label="Select transaction"
+              className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            >
+              <option value="">Choose a transaction...</option>
+              {candidates.map((tx) => (
+                <option key={tx.id} value={tx.id}>
+                  {tx.date} — {tx.enriched_name || tx.description} — {formatCurrency(tx.amount)}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {selectedTx && (
+            <>
+              <div>
+                <label className="text-sm font-medium">
+                  Amount to apply
+                </label>
+                <p className="text-xs text-muted-foreground">
+                  Transaction total: {formatCurrency(selectedTx.amount)}. Leave blank to use full amount.
+                </p>
+                <input
+                  type="number"
+                  min="0.01"
+                  max={selectedTx.amount}
+                  step="0.01"
+                  value={customAmount}
+                  onChange={(e) => setCustomAmount(e.target.value)}
+                  placeholder={selectedTx.amount.toFixed(2)}
+                  className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono"
+                />
+              </div>
+
+              {allocation.allocations.length > 0 && (
+                <div className="rounded-lg border bg-muted/30 p-4 space-y-2">
+                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+                    Allocation Preview
+                  </p>
+                  {allocation.allocations.map((alloc) => {
+                    const view = monthlyViews.find((v) => v.month === alloc.month);
+                    const fullyClears = view
+                      ? Math.abs(alloc.amount - view.remainingOwed) < 0.01
+                      : false;
+
+                    return (
+                      <div
+                        key={alloc.month}
+                        className="flex items-center justify-between text-sm"
+                      >
+                        <span>{format(monthDate(alloc.month), "MMMM yyyy")}</span>
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono font-medium">
+                            {formatCurrency(alloc.amount)}
+                          </span>
+                          <Badge variant={fullyClears ? "default" : "secondary"} className="text-[10px]">
+                            {fullyClears ? "Fully clears" : "Partial"}
+                          </Badge>
+                        </div>
+                      </div>
+                    );
+                  })}
+                  {allocation.overpayment > 0.01 && (
+                    <div className="flex items-center justify-between text-sm text-amber-700 dark:text-amber-300">
+                      <span>Overpayment (not allocated)</span>
+                      <span className="font-mono font-medium">
+                        {formatCurrency(allocation.overpayment)}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {unsettledMonths.length === 0 && (
+                <p className="text-sm text-muted-foreground">
+                  No unsettled months to apply this payment to.
+                </p>
+              )}
+            </>
+          )}
+
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" size="sm" onClick={onClose} disabled={busy}>
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              disabled={
+                busy ||
+                !selectedTx ||
+                allocation.allocations.length === 0 ||
+                paymentAmount < 0.01
+              }
+              onClick={() => {
+                if (selectedTx) {
+                  void onConfirm(selectedTx, allocation.allocations);
+                }
+              }}
+            >
+              {busy ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <Banknote className="mr-2 h-4 w-4" />
+              )}
+              Apply Payment
+            </Button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 export default function SettlementsPage() {
   const {
     categories,
@@ -1109,6 +1471,9 @@ export default function SettlementsPage() {
     null
   );
   const [enriching, setEnriching] = useState(false);
+  const [paymentDialogOpen, setPaymentDialogOpen] = useState(false);
+  const [applyingPayment, setApplyingPayment] = useState(false);
+  const [settlementToggling, setSettlementToggling] = useState(false);
   const didRefreshRef = useRef(false);
   const participants = getSettlementParticipants(users);
   const loading = dataLoading && lastFetched === 0;
@@ -1123,12 +1488,16 @@ export default function SettlementsPage() {
     ? buildMonthlySettlementViews(settlements, transactions, categories, participants)
     : [];
 
+  // Net outstanding uses remainingOwed (pending transfer minus payments applied)
   const outstandingNet = participants
-    ? monthlyViews.reduce(
-        (sum, view) =>
-          sum + getSignedTransferAmount(view.pending.transfer, participants[0].id),
-        0
-      )
+    ? monthlyViews.reduce((sum, view) => {
+        const pending = view.pending.transfer;
+        if (!pending.fromUserId || !pending.toUserId || pending.amount < 0.01) return sum;
+        const remaining = view.remainingOwed;
+        if (remaining < 0.01) return sum;
+        const signed = pending.toUserId === participants[0].id ? remaining : -remaining;
+        return sum + signed;
+      }, 0)
     : 0;
 
   const totalOutstandingTransfer: SettlementTransfer = participants
@@ -1353,6 +1722,130 @@ export default function SettlementsPage() {
     }
   }
 
+  async function handleApplySettlementPayment(
+    transaction: Transaction,
+    allocations: PaymentAllocation[]
+  ) {
+    if (!participants) return;
+
+    setApplyingPayment(true);
+    try {
+      // Update the transaction: set type to "settlement" and store allocations
+      const updated: Transaction = {
+        ...transaction,
+        transaction_type: SETTLEMENT_TRANSACTION_TYPE,
+        payment_allocations: allocations,
+      };
+      const encrypted_data = await encryptTransaction(
+        updated as unknown as Record<string, unknown>
+      );
+      const res = await fetch(`/api/transactions/${transaction.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ encrypted_data }),
+      });
+
+      if (!res.ok) {
+        toast.error("Failed to save settlement payment");
+        return;
+      }
+
+      updateTransactions((current) =>
+        current.map((tx) => (tx.id === updated.id ? updated : tx))
+      );
+
+      setPaymentDialogOpen(false);
+      toast.success(
+        `Payment applied across ${allocations.length} month${allocations.length === 1 ? "" : "s"}`
+      );
+    } catch {
+      toast.error("Failed to apply settlement payment");
+    } finally {
+      setApplyingPayment(false);
+    }
+  }
+
+  async function handleToggleSettlement(transaction: Transaction) {
+    if (!participants) return;
+
+    const isCurrentlySettlement =
+      transaction.transaction_type === SETTLEMENT_TRANSACTION_TYPE;
+
+    if (!isCurrentlySettlement && transaction.amount < 0.01) {
+      toast.error("Only positive (incoming) transactions can be settlement payments");
+      return;
+    }
+
+    setSettlementToggling(true);
+    try {
+
+      let updated: Transaction;
+      if (isCurrentlySettlement) {
+        // Unmark: restore original transaction_type and clear allocations
+        updated = {
+          ...transaction,
+          transaction_type: null,
+          payment_allocations: null,
+        };
+      } else {
+        // Mark: FIFO-allocate the transaction amount
+        const unsettled: UnsettledMonth[] = monthlyViews
+          .filter(
+            (view) =>
+              view.remainingOwed > 0.01 && view.pending.transfer.fromUserId
+          )
+          .map((view) => ({
+            month: view.month,
+            owed: view.remainingOwed,
+            settlement: view.record,
+            breakdown: view.pending,
+          }));
+
+        const { allocations } = allocatePayment(
+          Math.abs(transaction.amount),
+          unsettled
+        );
+
+        updated = {
+          ...transaction,
+          transaction_type: SETTLEMENT_TRANSACTION_TYPE,
+          payment_allocations: allocations.length > 0 ? allocations : null,
+        };
+      }
+
+      const encrypted_data = await encryptTransaction(
+        updated as unknown as Record<string, unknown>
+      );
+      const res = await fetch(`/api/transactions/${transaction.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ encrypted_data }),
+      });
+
+      if (!res.ok) {
+        toast.error("Failed to update transaction");
+        return;
+      }
+
+      updateTransactions((current) =>
+        current.map((tx) => (tx.id === updated.id ? updated : tx))
+      );
+      setDetailState((current) =>
+        current ? { ...current, transaction: updated } : current
+      );
+
+      toast.success(
+        isCurrentlySettlement
+          ? "Transaction unmarked as settlement payment"
+          : "Transaction marked as settlement payment"
+      );
+    } catch {
+      toast.error("Failed to update transaction");
+    } finally {
+      setSettlementToggling(false);
+    }
+  }
+
   if (loading || !participants) {
     return (
       <div className="flex items-center justify-center py-20">
@@ -1378,6 +1871,16 @@ export default function SettlementsPage() {
           </div>
         </div>
         <div className="mt-3 h-px bg-gradient-to-r from-border via-border to-transparent" />
+
+        <SettlementPaymentsPanel
+          transactions={transactions}
+          users={participants}
+          hasOutstanding={totalOutstandingTransfer.amount > 0.01}
+          onRecordPayment={() => setPaymentDialogOpen(true)}
+          onOpenTransaction={(tx) =>
+            setDetailState({ transaction: tx, isFrozen: false })
+          }
+        />
       </div>
 
       <div className="grid gap-4 md:grid-cols-3">
@@ -1461,6 +1964,18 @@ export default function SettlementsPage() {
         onClose={() => setDetailState(null)}
         onEnrich={handleEnrichTransaction}
         onUpdate={handleUpdateTransaction}
+        onToggleSettlement={handleToggleSettlement}
+        settlementToggling={settlementToggling}
+      />
+
+      <SettlementPaymentDialog
+        open={paymentDialogOpen}
+        onClose={() => setPaymentDialogOpen(false)}
+        transactions={transactions}
+        monthlyViews={monthlyViews}
+        participants={participants}
+        onConfirm={handleApplySettlementPayment}
+        busy={applyingPayment}
       />
     </div>
   );

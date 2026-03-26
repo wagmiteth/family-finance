@@ -7,6 +7,9 @@ import type {
   SettlementCategorySummary,
 } from "@/lib/types";
 
+/** transaction_type value used for settlement payment transactions */
+export const SETTLEMENT_TRANSACTION_TYPE = "settlement";
+
 const EPSILON = 0.01;
 
 type SettlementLikeTransaction = Pick<
@@ -19,7 +22,7 @@ type SettlementLikeTransaction = Pick<
   | "amount"
   | "date"
   | "created_at"
->;
+> & { transaction_type?: string | null };
 
 export interface SettlementTransfer {
   fromUserId: string | null;
@@ -73,11 +76,22 @@ function toSettlementSnapshot(
   };
 }
 
+export function isSettlementPayment(
+  transaction: Pick<Transaction, "transaction_type">
+) {
+  return transaction.transaction_type === "settlement";
+}
+
 function getRelevantKind(
   transaction: SettlementLikeTransaction,
   categoryById: Map<string, Category>,
   participantIds: Set<string>
 ) {
+  // Settlement payment transactions are never included in expense calculations
+  if (transaction.transaction_type === SETTLEMENT_TRANSACTION_TYPE) {
+    return null;
+  }
+
   if (!transaction.category_id || !transaction.user_id) {
     return null;
   }

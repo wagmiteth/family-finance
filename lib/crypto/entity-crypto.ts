@@ -28,6 +28,7 @@ const TRANSACTION_ENCRYPTED_FIELDS = [
   "enriched_description",
   "enriched_address",
   "enriched_at",
+  "payment_allocations",
 ] as const;
 
 /** Category fields stored in encrypted_data */
