@@ -71,6 +71,13 @@ export async function POST(request: Request) {
       );
     }
 
+    // owner_user_id scopes the rule to a single user (e.g. exclude rules).
+    // Validate that the caller can only set themselves as owner.
+    const ownerUserId = body.owner_user_id ?? null;
+    if (ownerUserId && ownerUserId !== appUser.id) {
+      return NextResponse.json({ error: "Cannot set owner_user_id to another user" }, { status: 403 });
+    }
+
     const { data: rule, error } = await supabase
       .from("merchant_rules")
       .insert({
@@ -79,6 +86,7 @@ export async function POST(request: Request) {
         category_id: body.category_id ?? null,
         priority: body.priority ?? 0,
         is_learned: body.is_learned ?? false,
+        owner_user_id: ownerUserId,
       })
       .select()
       .single();

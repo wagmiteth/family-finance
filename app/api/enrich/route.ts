@@ -15,7 +15,7 @@ export async function POST(request: Request) {
 
     const { data: appUser } = await supabase
       .from("users")
-      .select()
+      .select("id")
       .eq("auth_id", authUser.id)
       .single();
 
@@ -23,30 +23,21 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "User not found" }, { status: 404 });
     }
 
-    const { transactionIds, test, descriptions, apiKey: clientApiKey } = await request.json();
+    const { transactionIds, test, descriptions, apiKey } = await request.json();
 
-    // Resolve API key: prefer client-provided, fall back to stored key
-    let apiKey = clientApiKey;
-    if (!apiKey) {
-      const { data: settings } = await supabase
-        .from("user_settings")
-        .select("encrypted_api_key")
-        .eq("user_id", appUser.id)
-        .single();
-      apiKey = settings?.encrypted_api_key;
-    }
-
-    if (typeof apiKey !== "string" || !apiKey) {
+    if (typeof apiKey !== "string" || !apiKey.trim()) {
       return NextResponse.json(
         { error: "No API key configured. Add one in Settings." },
         { status: 400 }
       );
     }
 
+    const resolvedApiKey = apiKey.trim();
+
     // Test mode: validate the API key
     if (test) {
       try {
-        const anthropic = new Anthropic({ apiKey });
+        const anthropic = new Anthropic({ apiKey: resolvedApiKey });
         await anthropic.messages.create({
           model: "claude-sonnet-4-20250514",
           max_tokens: 10,
@@ -75,7 +66,7 @@ export async function POST(request: Request) {
 
     const items = descriptions as { id: string; name: string; amount?: number }[];
 
-    const anthropic = new Anthropic({ apiKey });
+    const anthropic = new Anthropic({ apiKey: resolvedApiKey });
 
     const message = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",

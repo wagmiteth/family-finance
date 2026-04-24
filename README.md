@@ -15,7 +15,7 @@ A shared household expense tracker with end-to-end encryption. Built for couples
 
 ### Zero-Knowledge Architecture
 
-Inspired by [Proton Mail](https://proton.me/mail), Family Finance implements client-side encryption where the server never sees your data in plaintext.
+Inspired by [Proton Mail](https://proton.me/mail), Family Finance implements client-side encryption for core app data so the server never stores your financial records in plaintext.
 
 ```text
 Your Password
@@ -27,14 +27,14 @@ Key Encryption Key (KEK)
 Data Encryption Key (DEK) — one per household
     |
     v  AES-GCM-256 (encrypt/decrypt)
-ALL your data — transactions, categories, settlements, names, API keys
+Stored data — transactions, categories, settlements, names, API keys
 ```
 
 **What the server can see:**
 
 - Email addresses (required for authentication)
-- Opaque UUIDs and timestamps (structural metadata)
-- Import hashes (SHA-256, irreversible — used for deduplication)
+- Opaque UUIDs and structural metadata such as timestamps, booleans, sort-order integers, invite state, and limited import bookkeeping
+- Deterministic import hashes used for deduplication
 
 **What the server cannot see:**
 
@@ -46,9 +46,9 @@ ALL your data — transactions, categories, settlements, names, API keys
 **Exceptions to zero-knowledge (plaintext on server):**
 
 - **Invite preview fields** — When creating a household, the creator's name, household name, and avatar are stored in plaintext so the invite page can show who is inviting. These are non-sensitive display hints.
-- **Anthropic API key** — If you opt in to AI enrichment, your API key is stored server-side and transaction descriptions are temporarily sent to the Anthropic API in plaintext. A warning is shown in the UI. Users who prefer full privacy should not use this feature.
+- **AI enrichment** — If you opt in to AI enrichment, your API key is stored as client-encrypted ciphertext. When you use enrichment, the browser decrypts the key and selected transaction descriptions, then sends them transiently through the Family Finance server to Anthropic in plaintext. Family Finance does not persist those plaintext values. A warning is shown in the UI. Users who prefer full privacy should not use this feature.
 
-Apart from these opt-in exceptions, the server is an encrypted storage layer — it cannot read, filter, or validate any user data. All processing (filtering, sorting, settlement calculation, auto-categorization) happens client-side in the browser after decryption.
+Apart from these exceptions, the server is an encrypted storage layer for the app's core data. Filtering, sorting, settlement calculation, and auto-categorization happen client-side in the browser after decryption.
 
 ### Key Exchange
 
@@ -75,7 +75,7 @@ All database tables use Supabase Row Level Security (RLS) policies to enforce ho
 - **Database:** Supabase (PostgreSQL with RLS)
 - **Auth:** Supabase Auth (email/password)
 - **Encryption:** Web Crypto API (AES-GCM, AES-KW, PBKDF2)
-- **AI:** Anthropic Claude API (user-provided key, stored server-side — see note below)
+- **AI:** Anthropic Claude API (user-provided key, encrypted at rest — see note below)
 - **Drag & Drop:** dnd-kit
 - **Charts:** Recharts
 

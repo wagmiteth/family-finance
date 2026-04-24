@@ -27,7 +27,7 @@ A shared household expense tracker built with Next.js and Supabase, featuring st
 The server (and database admin) can **only** see:
 - Email addresses (Supabase Auth)
 - UUIDs, timestamps, booleans, sort order integers (opaque metadata)
-- Import hashes (SHA-256, irreversible)
+- Deterministic import hashes used for deduplication
 
 The server **cannot** see:
 - Transaction data (amounts, dates, descriptions, bank details, notes)
@@ -35,7 +35,7 @@ The server **cannot** see:
 - User names, household names
 - Merchant rule patterns
 - Settlement amounts and details
-- Anthropic API keys
+- Stored Anthropic API key ciphertext
 
 ### Encryption Model
 - Each household has a **Data Encryption Key (DEK)** — AES-GCM 256-bit
@@ -65,7 +65,7 @@ Since the server cannot read any data, all processing happens in the browser:
 - **Filtering/sorting** transactions by date, amount, category
 - **Settlement calculation** (who owes whom)
 - **Auto-categorization** using merchant rules
-- **API key decryption** for AI enrichment (sent transiently in request body)
+- **API key decryption** for AI enrichment (sent transiently through the app server to Anthropic)
 
 ### Important: Password = Encryption Key
 If both household members forget their passwords, all financial data is **permanently lost**. There is no recovery mechanism. This is by design — identical to Proton Mail's security model.

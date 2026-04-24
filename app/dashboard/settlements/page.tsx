@@ -26,6 +26,7 @@ import {
 } from "@/components/ui/dialog";
 import { Separator } from "@/components/ui/separator";
 import { TransactionDetailDialog } from "@/components/transaction-detail-dialog";
+import { getStoredAnthropicApiKey } from "@/lib/crypto/anthropic-api-key";
 import { useData } from "@/lib/crypto/data-provider";
 import { encryptSettlement, encryptTransaction } from "@/lib/crypto/entity-crypto";
 import {
@@ -34,11 +35,11 @@ import {
   SETTLEMENT_TRANSACTION_TYPE,
   type SettlementBreakdown,
   type SettlementTransfer,
-  generateSettlementHash,
   getSettlementParticipants,
 } from "@/lib/settlements/calculator";
 import {
   allocatePayment,
+  buildPaymentRef,
   getPaymentsAppliedToMonth,
   type UnsettledMonth,
 } from "@/lib/settlements/allocator";
@@ -47,6 +48,7 @@ import type {
   PaymentAllocation,
   Settlement,
   SettlementBatch,
+  SettlementPaymentRef,
   SettlementTransactionSnapshot,
   Transaction,
   User,
@@ -71,6 +73,21 @@ interface MonthlySettlementView {
 interface SettlementDetailState {
   transaction: Transaction;
   isFrozen: boolean;
+}
+
+function getStoredPaymentsApplied(paymentRefs?: SettlementPaymentRef[] | null) {
+  return Math.round(
+    (paymentRefs || []).reduce((sum, ref) => sum + ref.amount, 0) * 100
+  ) / 100;
+}
+
+function getStoredPaymentsAppliedForBatches(settlementBatches: SettlementBatch[]) {
+  return Math.round(
+    settlementBatches.reduce(
+      (sum, batch) => sum + getStoredPaymentsApplied(batch.payment_refs),
+      0
+    ) * 100
+  ) / 100;
 }
 
 function formatCurrency(amount: number) {
@@ -273,14 +290,26 @@ function getStoredBatches(
   categories: Category[],
   users: User[]
 ) {
-  if (!settlement) {
+  if (!settlement || !settlement.is_settled) {
     return [];
   }
 
+  const currentTransactionIds = new Set(
+    currentRelevantTransactions.map((transaction) => transaction.id)
+  );
+
   if (settlement.settlement_batches?.length) {
-    return [...settlement.settlement_batches].sort((left, right) =>
+    const sortedBatches = [...settlement.settlement_batches].sort((left, right) =>
       compareIso(left.settled_at, right.settled_at)
     );
+
+    const hasMissingSnapshotTransaction = sortedBatches.some((batch) =>
+      batch.transactions.some(
+        (transaction) => !currentTransactionIds.has(transaction.id)
+      )
+    );
+
+    return hasMissingSnapshotTransaction ? [] : sortedBatches;
   }
 
   const legacyBatch = buildLegacyBatch(
@@ -290,18 +319,15 @@ function getStoredBatches(
     users
   );
 
-  return legacyBatch ? [legacyBatch] : [];
-}
-
-function getSignedTransferAmount(
-  transfer: SettlementTransfer,
-  firstUserId: string
-) {
-  if (!transfer.fromUserId || !transfer.toUserId || transfer.amount < 0.01) {
-    return 0;
+  if (!legacyBatch) {
+    return [];
   }
 
-  return transfer.toUserId === firstUserId ? transfer.amount : -transfer.amount;
+  const hasMissingSnapshotTransaction = legacyBatch.transactions.some(
+    (transaction) => !currentTransactionIds.has(transaction.id)
+  );
+
+  return hasMissingSnapshotTransaction ? [] : [legacyBatch];
 }
 
 function buildSettlementPayload(
@@ -356,7 +382,7 @@ function buildMonthlySettlementViews(
   const settlementByMonth = new Map<string, Settlement>();
   for (const settlement of settlements) {
     const currentMonth = monthKey(settlement.month);
-    if (currentMonth) {
+    if (currentMonth && !settlementByMonth.has(currentMonth)) {
       settlementByMonth.set(currentMonth, settlement);
     }
   }
@@ -398,6 +424,10 @@ function buildMonthlySettlementViews(
         categories,
         users
       );
+      const livePaymentsApplied = getPaymentsAppliedToMonth(month, transactions);
+      const storedPaymentsApplied = getStoredPaymentsAppliedForBatches(
+        settledBatches
+      );
       const includedIds = new Set(
         settledBatches.flatMap((batch) =>
           batch.transactions.map((transaction) => transaction.id)
@@ -418,7 +448,10 @@ function buildMonthlySettlementViews(
             uncategorizedCategoryIds.has(transaction.category_id))
       );
 
-      const paymentsApplied = getPaymentsAppliedToMonth(month, transactions);
+      const paymentsApplied = Math.max(
+        livePaymentsApplied,
+        storedPaymentsApplied
+      );
       const pendingOwed = pending.transfer.amount;
       const remainingOwed = Math.max(0, Math.round((pendingOwed - paymentsApplied) * 100) / 100);
 
@@ -447,7 +480,9 @@ function buildMonthlySettlementViews(
     .sort((left, right) => right.month.localeCompare(left.month));
 
   // Second pass: auto-allocate unallocated settlement payments (marked from
-  // the transactions page without FIFO allocation) against remaining balances
+  // the transactions page without FIFO allocation) against remaining balances.
+  // Use the TOTAL month debt (not pending) as the allocation ceiling so that
+  // settling a month doesn't cause its share of payments to spill into others.
   const unallocatedPayments = transactions.filter(
     (tx) =>
       tx.transaction_type === "settlement" &&
@@ -461,19 +496,38 @@ function buildMonthlySettlementViews(
       a.date.localeCompare(b.date)
     );
 
-    // Process months oldest-first for FIFO
+    // Process months oldest-first for FIFO.
+    // Track allocation capacity per month using total debt (settled + pending)
+    // so that settled months still absorb their share of unallocated payments.
     const monthsAsc = [...views]
       .sort((a, b) => a.month.localeCompare(b.month));
+
+    // Compute each month's total capacity: total debt minus explicitly-allocated payments
+    const monthCapacity = new Map<string, number>();
+    for (const view of monthsAsc) {
+      const totalOwed = view.monthTotal.transfer.amount;
+      monthCapacity.set(
+        view.month,
+        Math.max(0, Math.round((totalOwed - view.paymentsApplied) * 100) / 100)
+      );
+    }
 
     for (const tx of sorted) {
       let remaining = Math.abs(tx.amount);
       for (const view of monthsAsc) {
         if (remaining < 0.01) break;
-        if (view.remainingOwed < 0.01) continue;
+        const capacity = monthCapacity.get(view.month) ?? 0;
+        if (capacity < 0.01) continue;
 
-        const applied = Math.min(remaining, view.remainingOwed);
-        view.paymentsApplied = Math.round((view.paymentsApplied + applied) * 100) / 100;
-        view.remainingOwed = Math.max(0, Math.round((view.remainingOwed - applied) * 100) / 100);
+        const applied = Math.min(remaining, capacity);
+        monthCapacity.set(view.month, Math.round((capacity - applied) * 100) / 100);
+
+        // Only credit the visible remainingOwed (pending-based)
+        const actualCredit = Math.min(applied, view.remainingOwed);
+        if (actualCredit > 0) {
+          view.paymentsApplied = Math.round((view.paymentsApplied + actualCredit) * 100) / 100;
+          view.remainingOwed = Math.max(0, Math.round((view.remainingOwed - actualCredit) * 100) / 100);
+        }
         remaining -= applied;
       }
     }
@@ -487,11 +541,15 @@ function TransferSummary({
   users,
   emptyLabel = "All settled",
   amountClassName,
+  adjustedAmount,
+  adjustedCaption,
 }: {
   transfer: SettlementTransfer;
   users: User[];
   emptyLabel?: string;
   amountClassName?: string;
+  adjustedAmount?: number;
+  adjustedCaption?: string;
 }) {
   if (!transfer.fromUserId || !transfer.toUserId || transfer.amount < 0.01) {
     return (
@@ -512,14 +570,35 @@ function TransferSummary({
     );
   }
 
+  const showAdjustedAmount =
+    typeof adjustedAmount === "number" &&
+    adjustedAmount >= 0 &&
+    Math.abs(adjustedAmount - transfer.amount) > 0.01;
+
   return (
     <div className="flex items-center gap-3 rounded-lg bg-muted/60 px-4 py-3">
       <span className="text-sm font-medium">{fromUser.name}</span>
       <ArrowRight className="h-3.5 w-3.5 shrink-0 text-warm" />
       <span className="text-sm font-medium">{toUser.name}</span>
-      <span className={cn("ml-auto font-heading text-lg font-bold", amountClassName)}>
-        {formatCurrency(transfer.amount)}
-      </span>
+      <div className="ml-auto text-right">
+        {showAdjustedAmount ? (
+          <>
+            <p className="text-xs font-medium text-muted-foreground line-through">
+              {formatCurrency(transfer.amount)}
+            </p>
+            <p className={cn("font-heading text-lg font-bold", amountClassName)}>
+              {formatCurrency(adjustedAmount)}
+            </p>
+            {adjustedCaption && (
+              <p className="text-xs text-muted-foreground">{adjustedCaption}</p>
+            )}
+          </>
+        ) : (
+          <span className={cn("font-heading text-lg font-bold", amountClassName)}>
+            {formatCurrency(transfer.amount)}
+          </span>
+        )}
+      </div>
     </div>
   );
 }
@@ -867,6 +946,11 @@ function SettledBatchCard({
 }) {
   const [expanded, setExpanded] = useState(false);
   const breakdown = buildStoredBatchBreakdown(batch, categories, users);
+  const paymentsApplied = getStoredPaymentsApplied(batch.payment_refs);
+  const remainingAfterPayments = Math.max(
+    0,
+    Math.round((breakdown.transfer.amount - paymentsApplied) * 100) / 100
+  );
   const frozenTransactionIds = new Set(
     batch.transactions.map((transaction) => transaction.id)
   );
@@ -893,6 +977,14 @@ function SettledBatchCard({
           transfer={breakdown.transfer}
           users={users}
           emptyLabel="This batch was balanced"
+          adjustedAmount={paymentsApplied > 0.01 ? remainingAfterPayments : undefined}
+          adjustedCaption={
+            paymentsApplied > 0.01
+              ? remainingAfterPayments > 0.01
+                ? "still remaining"
+                : "fully paid"
+              : undefined
+          }
         />
       </div>
 
@@ -953,6 +1045,17 @@ function SettlementCard({
   const [expanded, setExpanded] = useState(false);
   const hasPending = view.pending.transactionCount > 0;
   const hasUncategorized = view.uncategorizedCount > 0;
+  const settledMonthRemaining = Math.max(
+    0,
+    Math.round((view.monthTotal.transfer.amount - view.paymentsApplied) * 100) / 100
+  );
+  const showSettledPaymentAdjustment =
+    !hasPending &&
+    view.paymentsApplied > 0.01 &&
+    view.monthTotal.transfer.amount > 0.01;
+  const visibleRemainingOwed = showSettledPaymentAdjustment
+    ? settledMonthRemaining
+    : view.remainingOwed;
   const settledTransactionIds = new Set(
     view.settledBatches.flatMap((batch) =>
       batch.transactions.map((transaction) => transaction.id)
@@ -1005,6 +1108,16 @@ function SettlementCard({
               transfer={view.monthTotal.transfer}
               users={users}
               emptyLabel="The month is balanced overall"
+              adjustedAmount={
+                showSettledPaymentAdjustment ? settledMonthRemaining : undefined
+              }
+              adjustedCaption={
+                showSettledPaymentAdjustment
+                  ? settledMonthRemaining > 0.01
+                    ? "still remaining"
+                    : "fully paid"
+                  : undefined
+              }
             />
           </div>
           <div className="mt-3 grid gap-3 md:grid-cols-3">
@@ -1023,7 +1136,7 @@ function SettlementCard({
             <div className="rounded-lg bg-background/80 px-3 py-3">
               <p className="text-xs text-muted-foreground">Remaining owed</p>
               <p className="mt-1 font-mono font-semibold">
-                {formatCurrency(view.remainingOwed)}
+                {formatCurrency(visibleRemainingOwed)}
               </p>
             </div>
           </div>
@@ -1057,6 +1170,14 @@ function SettlementCard({
               users={users}
               emptyLabel="No new settlement-affecting transactions since the last settled batch"
               amountClassName="text-blue-800 dark:text-blue-300"
+              adjustedAmount={view.paymentsApplied > 0.01 ? view.remainingOwed : undefined}
+              adjustedCaption={
+                view.paymentsApplied > 0.01
+                  ? view.remainingOwed > 0.01
+                    ? "still remaining"
+                    : "fully paid"
+                  : undefined
+              }
             />
           </div>
           <p className="mt-2 text-sm text-blue-800 dark:text-blue-300">
@@ -1076,11 +1197,7 @@ function SettlementCard({
                   {formatCurrency(view.paymentsApplied)}
                 </span>
               </div>
-              {view.remainingOwed > 0.01 ? (
-                <p className="mt-1 text-xs text-emerald-700 dark:text-emerald-400">
-                  {formatCurrency(view.remainingOwed)} still remaining
-                </p>
-              ) : (
+              {view.remainingOwed <= 0.01 && (
                 <p className="mt-1 text-xs text-emerald-700 dark:text-emerald-400">
                   This month is fully paid
                 </p>
@@ -1315,7 +1432,6 @@ function SettlementPaymentDialog({
   onClose,
   transactions,
   monthlyViews,
-  participants,
   onConfirm,
   busy,
 }: {
@@ -1323,7 +1439,6 @@ function SettlementPaymentDialog({
   onClose: () => void;
   transactions: Transaction[];
   monthlyViews: MonthlySettlementView[];
-  participants: [User, User];
   onConfirm: (transaction: Transaction, allocations: PaymentAllocation[]) => Promise<void>;
   busy: boolean;
 }) {
@@ -1583,10 +1698,17 @@ export default function SettlementsPage() {
     setEnriching(true);
 
     try {
+      const apiKey = await getStoredAnthropicApiKey();
+      if (!apiKey) {
+        toast.error("No API key configured. Add one in Settings.");
+        return;
+      }
+
       const res = await fetch("/api/enrich", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          apiKey,
           transactionIds: [transaction.id],
           descriptions: [{ id: transaction.id, name: transaction.description, amount: transaction.amount }],
         }),
@@ -1633,8 +1755,10 @@ export default function SettlementsPage() {
         current ? { ...current, transaction: updated } : current
       );
       toast.success("Transaction enriched");
-    } catch {
-      toast.error("Failed to enrich transaction");
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to enrich transaction"
+      );
     } finally {
       setEnriching(false);
     }
@@ -1659,7 +1783,6 @@ export default function SettlementsPage() {
       throw new Error("Missing household data");
     }
 
-    const settlementHash = await generateSettlementHash(household.id, view.month);
     const encryptedData = await encryptSettlement(
       buildSettlementPayload(
         view.month,
@@ -1676,16 +1799,18 @@ export default function SettlementsPage() {
         ? settlementBatches[settlementBatches.length - 1]
         : null;
 
-    const res = await fetch("/api/settlements", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        settlement_hash: settlementHash,
-        encrypted_data: encryptedData,
-        is_settled: settlementBatches.length > 0,
-        settled_at: latestBatch?.settled_at ?? null,
-      }),
-    });
+    const res = await fetch(
+      view.record ? `/api/settlements/${view.record.id}` : "/api/settlements",
+      {
+        method: view.record ? "PATCH" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          encrypted_data: encryptedData,
+          is_settled: settlementBatches.length > 0,
+          settled_at: latestBatch?.settled_at ?? null,
+        }),
+      }
+    );
 
     if (!res.ok) {
       throw new Error("Failed to save settlement");
@@ -1716,6 +1841,27 @@ export default function SettlementsPage() {
     setBusyMonth(view.month);
 
     try {
+      const totalOwedBeforePayments = Math.round(
+        (view.remainingOwed + view.paymentsApplied) * 100
+      ) / 100;
+      const paymentRefs = transactions
+        .filter(
+          (transaction) =>
+            transaction.transaction_type === SETTLEMENT_TRANSACTION_TYPE &&
+            transaction.payment_allocations?.some((allocation) => allocation.month === view.month)
+        )
+        .flatMap((transaction) =>
+          (transaction.payment_allocations || [])
+            .filter((allocation) => allocation.month === view.month)
+            .map((allocation) =>
+              buildPaymentRef(
+                transaction,
+                allocation.amount,
+                totalOwedBeforePayments
+              )
+            )
+        );
+
       const newBatch: SettlementBatch = {
         id: crypto.randomUUID(),
         settled_at: new Date().toISOString(),
@@ -1726,6 +1872,7 @@ export default function SettlementsPage() {
         users: view.pending.users,
         categories: view.pending.categories,
         transactions: view.pending.transactions,
+        payment_refs: paymentRefs.length > 0 ? paymentRefs : undefined,
       };
 
       await upsertSettlementMonth(view, [...view.settledBatches, newBatch]);

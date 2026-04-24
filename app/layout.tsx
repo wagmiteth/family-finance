@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { Agentation } from "agentation";
 import { Toaster } from "@/components/ui/sonner";
 import { EncryptionProvider } from "@/lib/crypto/encryption-context";
 import "./globals.css";
@@ -19,6 +20,7 @@ export default function RootLayout({
         <EncryptionProvider>
           {children}
         </EncryptionProvider>
+        {process.env.NODE_ENV === "development" && <Agentation />}
         <Toaster
           closeButton
           toastOptions={{

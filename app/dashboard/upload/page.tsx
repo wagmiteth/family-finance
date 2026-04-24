@@ -1,13 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { parseFiles } from "@/lib/transactions/parser";
-import { autoCategorizeImport } from "@/lib/transactions/categorizer";
+import { autoCategorizeImport, checkExcludeRule } from "@/lib/transactions/categorizer";
 import { encryptTransaction, encryptFields, decryptEntities, decryptEntity } from "@/lib/crypto/entity-crypto";
 import { getDEK } from "@/lib/crypto/key-store";
 import { generateImportHash, generateLegacyImportHash, txSignature } from "@/lib/transactions/dedup";
-import { hasDEK } from "@/lib/crypto/key-store";
 import { useData } from "@/lib/crypto/data-provider";
 import { isDeletedCategory } from "@/lib/categories";
 import { Button } from "@/components/ui/button";
@@ -47,6 +47,10 @@ import {
   Info,
   Copy,
   ShieldCheck,
+  AlertTriangle,
+  EyeOff,
+  Eye,
+  CalendarDays,
 } from "lucide-react";
 import {
   Dialog,
@@ -58,16 +62,18 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { DateRangePicker } from "@/components/ui/date-range-picker";
+import type { DateRange } from "react-day-picker";
 import { toast } from "sonner";
 import type {
-  ParsedTransaction,
   FileParseResult,
-  AccountMetadata,
   User,
   MerchantRule,
   Category,
   FileFormat,
+  Transaction,
 } from "@/lib/types";
+import { SETTLEMENT_TRANSACTION_TYPE } from "@/lib/settlements/calculator";
 
 interface UploadBatchStats {
   skipped_exact?: number;
@@ -97,6 +103,21 @@ function formatCurrency(amount: number) {
     minimumFractionDigits: 0,
     maximumFractionDigits: 0,
   });
+}
+
+// Local-date ISO "YYYY-MM-DD" (avoids UTC off-by-one from toISOString).
+function toISODate(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function parseISODate(s: string): Date | undefined {
+  if (!s) return undefined;
+  const [y, m, d] = s.slice(0, 10).split("-").map(Number);
+  if (!y || !m || !d) return undefined;
+  return new Date(y, m - 1, d);
 }
 
 const FORMAT_LABELS: Record<FileFormat, string> = {
@@ -140,6 +161,7 @@ export default function UploadPage() {
   const [categories, setCategories] = useState<Category[]>([]);
   const merchantRulesRef = useRef<MerchantRule[]>([]);
   const [selectedUserId, setSelectedUserId] = useState<string>("");
+  const [currentUserId, setCurrentUserId] = useState<string>("");
   const [householdId, setHouseholdId] = useState<string>("");
   const [isDragOver, setIsDragOver] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -149,6 +171,13 @@ export default function UploadPage() {
   const [showDeleteAllDialog, setShowDeleteAllDialog] = useState(false);
   const [deleteConfirmText, setDeleteConfirmText] = useState("");
   const [expandedBatchId, setExpandedBatchId] = useState<string | null>(null);
+  const [deleteBatchDialog, setDeleteBatchDialog] = useState<{
+    batchId: string;
+    settledCount: number;
+    settlementPaymentCount: number;
+    affectedMonths: string[];
+    affectedSettlementIds: string[]; // settlement IDs to fully reopen
+  } | null>(null);
   const [dedupCheck, setDedupCheck] = useState<{
     loading: boolean;
     existingHashes: Set<string>;
@@ -158,7 +187,15 @@ export default function UploadPage() {
     willImport: number;
     /** Set of transaction indices (within allTransactions non-dup list) that are new */
     newIndices: Set<number>;
+    /** Per-nonDup-index dedup status: 'new' | 'exact' | 'legacy' */
+    statusByIndex: Array<"new" | "exact" | "legacy">;
   } | null>(null);
+  // Exclusion tracking — indices into the non-duplicate transaction list
+  const [excludedIndices, setExcludedIndices] = useState<Set<number>>(new Set());
+  const [savingExcludeRule, setSavingExcludeRule] = useState(false);
+  const [excludeRuleSaved, setExcludeRuleSaved] = useState<Set<number>>(new Set());
+  // Date range filter — limits which transactions get imported. Undefined = no filter.
+  const [dateRange, setDateRange] = useState<DateRange | undefined>(undefined);
 
   // Derived state — memoize to keep stable references
   const allTransactions = useMemo(() => fileResults.flatMap((r) => r.transactions), [fileResults]);
@@ -175,6 +212,124 @@ export default function UploadPage() {
   const newCount = allTransactions.filter((t) => !t.isDuplicate).length;
   const dupCount = allTransactions.filter((t) => t.isDuplicate).length;
   const autoCatCount = allTransactions.filter((t) => t.autoCategory).length;
+  const excludedCount = excludedIndices.size;
+  // Count excluded that are actually importable (new, not dedup-skipped)
+  const importableExcluded = dedupCheck && !dedupCheck.loading
+    ? [...excludedIndices].filter((i) => dedupCheck.newIndices.has(i)).length
+    : excludedCount;
+
+  // Date range filter — indices (into non-duplicate list) that fall outside the selected range.
+  // Defer the heavy recompute so the calendar stays responsive while user clicks around.
+  const deferredDateRange = useDeferredValue(dateRange);
+  const dateRangeFromStr = useMemo(
+    () => (deferredDateRange?.from ? toISODate(deferredDateRange.from) : null),
+    [deferredDateRange?.from]
+  );
+  const dateRangeToStr = useMemo(
+    () => (deferredDateRange?.to ? toISODate(deferredDateRange.to) : null),
+    [deferredDateRange?.to]
+  );
+  const outsideRangeIndices = useMemo(() => {
+    const out = new Set<number>();
+    if (!dateRangeFromStr && !dateRangeToStr) return out;
+    const nonDup = allTransactions.filter((t) => !t.isDuplicate);
+    nonDup.forEach((t, i) => {
+      const d = (t.date || "").slice(0, 10);
+      if (dateRangeFromStr && d < dateRangeFromStr) out.add(i);
+      else if (dateRangeToStr && d > dateRangeToStr) out.add(i);
+    });
+    return out;
+  }, [allTransactions, dateRangeFromStr, dateRangeToStr]);
+
+  // Count new transactions dropped by date filter (new AND not already excluded)
+  const importableOutsideRange = useMemo(() => {
+    if (outsideRangeIndices.size === 0) return 0;
+    const newSet = dedupCheck && !dedupCheck.loading ? dedupCheck.newIndices : null;
+    let count = 0;
+    for (const i of outsideRangeIndices) {
+      if (excludedIndices.has(i)) continue;
+      if (newSet && !newSet.has(i)) continue;
+      count++;
+    }
+    return count;
+  }, [outsideRangeIndices, excludedIndices, dedupCheck]);
+
+  const importableCount =
+    (dedupCheck && !dedupCheck.loading ? dedupCheck.willImport : newCount) -
+    importableExcluded -
+    importableOutsideRange;
+
+  // Counts reflecting the selected date range. Null when no range is active — tiles
+  // should fall back to their raw full-file counts in that case.
+  const rangeFiltered = useMemo(() => {
+    const hasRange = Boolean(dateRangeFromStr || dateRangeToStr);
+    if (!hasRange) return null;
+
+    const inRange = (d: string) => {
+      const s = (d || "").slice(0, 10);
+      if (dateRangeFromStr && s < dateRangeFromStr) return false;
+      if (dateRangeToStr && s > dateRangeToStr) return false;
+      return true;
+    };
+
+    let inFile = 0;
+    let duplicates = 0;
+    let autoCat = 0;
+    let totalSum = 0;
+    const monthlySumsMap = new Map<string, number>();
+    const accountCounts = new Map<string, number>();
+    const nonDupTxsInRange: typeof allTransactions = [];
+
+    for (const t of allTransactions) {
+      if (!inRange(t.date)) continue;
+      inFile++;
+      if (t.isDuplicate) {
+        duplicates++;
+        continue;
+      }
+      nonDupTxsInRange.push(t);
+      if (t.autoCategory) autoCat++;
+      totalSum += t.amount;
+      const month = t.date.slice(0, 7);
+      monthlySumsMap.set(month, (monthlySumsMap.get(month) || 0) + t.amount);
+      const key = t.bank_name
+        ? `${t.bank_name} ${t.account_number || ""}`.trim()
+        : "Unknown";
+      accountCounts.set(key, (accountCounts.get(key) || 0) + 1);
+    }
+
+    // Skipped counts — iterate nonDup indices, skip the ones outside range.
+    let skippedExact = 0;
+    let skippedLegacy = 0;
+    if (dedupCheck && !dedupCheck.loading && dedupCheck.statusByIndex.length) {
+      const nonDup = allTransactions.filter((t) => !t.isDuplicate);
+      nonDup.forEach((_, i) => {
+        if (outsideRangeIndices.has(i)) return;
+        const status = dedupCheck.statusByIndex[i];
+        if (status === "exact") skippedExact++;
+        else if (status === "legacy") skippedLegacy++;
+      });
+    }
+
+    const monthlySums = [...monthlySumsMap.entries()]
+      .map(([month, sum]) => ({ month, sum: Math.round(sum * 100) / 100 }))
+      .sort((a, b) => b.month.localeCompare(a.month));
+
+    const accounts = [...accountCounts.entries()]
+      .map(([name, count]) => ({ name, count }))
+      .sort((a, b) => b.count - a.count);
+
+    return {
+      inFile,
+      duplicates,
+      autoCat,
+      skippedExact,
+      skippedLegacy,
+      totalSum: Math.round(totalSum * 100) / 100,
+      monthlySums,
+      accounts,
+    };
+  }, [allTransactions, dateRangeFromStr, dateRangeToStr, dedupCheck, outsideRangeIndices]);
   const categoryMap = useMemo(() => {
     const m = new Map<string, string>();
     for (const c of categories) {
@@ -268,6 +423,7 @@ export default function UploadPage() {
           const rawUser = await userRes.json();
           const currentUser = await decryptEntity(rawUser, dek) as unknown as User;
           setSelectedUserId(currentUser.id);
+          setCurrentUserId(currentUser.id);
           if (rawUser.household_id) setHouseholdId(rawUser.household_id);
         }
 
@@ -309,24 +465,41 @@ export default function UploadPage() {
     fetchBatches();
   }, []);
 
-  // Re-run auto-categorization when merchant rules load after files are already parsed
+  // Re-run auto-categorization + exclude rules when merchant rules load after files are already parsed
   useEffect(() => {
     if (merchantRules.length === 0 || fileResults.length === 0) return;
 
     setFileResults((prev) =>
       prev.map((result) => ({
         ...result,
-        transactions: result.transactions.map((t) => ({
-          ...t,
-          autoCategory:
-            t.autoCategory ??
-            autoCategorizeImport(
-              t.transaction_type || null,
-              merchantRules
-            ),
-        })),
+        transactions: result.transactions.map((t) => {
+          const excludeMatch = checkExcludeRule(t.description, t.amount, merchantRules);
+          return {
+            ...t,
+            autoCategory:
+              t.autoCategory ??
+              autoCategorizeImport(
+                t.transaction_type || null,
+                merchantRules
+              ),
+            isExcluded: excludeMatch ? true : t.isExcluded,
+            excludeRuleId: excludeMatch?.id ?? t.excludeRuleId,
+          };
+        }),
       }))
     );
+
+    // Build initial excludedIndices from exclude rules
+    const allTxs = fileResults.flatMap((r) => r.transactions);
+    const nonDup = allTxs.filter((t) => !t.isDuplicate);
+    const initialExcluded = new Set<number>();
+    nonDup.forEach((t, i) => {
+      const excludeMatch = checkExcludeRule(t.description, t.amount, merchantRules);
+      if (excludeMatch) initialExcluded.add(i);
+    });
+    if (initialExcluded.size > 0) {
+      setExcludedIndices(initialExcluded);
+    }
   }, [merchantRules]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Run server-side dedup check when files are loaded.
@@ -347,6 +520,7 @@ export default function UploadPage() {
       skippedLegacy: 0,
       willImport: txs.length,
       newIndices: new Set(),
+      statusByIndex: [],
     });
 
     (async () => {
@@ -412,16 +586,20 @@ export default function UploadPage() {
         let skippedLegacy = 0;
         let willImport = 0;
         const newIndices = new Set<number>();
+        const statusByIndex: Array<"new" | "exact" | "legacy"> = new Array(hashData.length);
 
         for (let idx = 0; idx < hashData.length; idx++) {
           const h = hashData[idx];
           if (existingSet.has(h.newHash)) {
             skippedExact++;
+            statusByIndex[idx] = "exact";
           } else if (h.legacyHash && existingSet.has(h.legacyHash)) {
             skippedLegacy++;
+            statusByIndex[idx] = "legacy";
           } else {
             willImport++;
             newIndices.add(idx);
+            statusByIndex[idx] = "new";
           }
         }
 
@@ -434,6 +612,7 @@ export default function UploadPage() {
             skippedLegacy,
             willImport,
             newIndices,
+            statusByIndex,
           });
         }
       } catch {
@@ -444,10 +623,182 @@ export default function UploadPage() {
     return () => { cancelled = true; };
   }, [fileResults, householdId]);
 
-  async function handleDeleteBatch(batchId: string) {
+  function analyzeSettlementImpact(batchId: string) {
+    const batchTxs = dataCache.transactions.filter(
+      (t: Transaction) => t.batch_id === batchId
+    );
+
+    if (batchTxs.length === 0) return { settledCount: 0, settlementPaymentCount: 0, affectedMonths: [] as string[], affectedSettlementIds: [] as string[] };
+
+    // Collect months that this batch's transactions fall in (YYYY-MM format)
+    const batchMonths = new Set<string>();
+    for (const t of batchTxs) {
+      if (t.date) batchMonths.add(t.date.slice(0, 7));
+    }
+
+    const batchTxIds = new Set(batchTxs.map((t) => t.id));
+    let settledCount = 0;
+    const affectedMonthsSet = new Set<string>();
+    const affectedSettlementIds = new Set<string>();
+    const settledMonthsToReopen = new Set<string>();
+
+    for (const settlement of dataCache.settlements) {
+      const hasStoredSettledData =
+        settlement.is_settled ||
+        Boolean(settlement.settlement_batches?.length) ||
+        Boolean(settlement.settled_at && settlement.settled_transactions?.length);
+      if (!hasStoredSettledData) continue;
+
+      // settlement.month is stored as "YYYY-MM-01"; extract "YYYY-MM"
+      const settlementMonth = settlement.month?.slice(0, 7);
+      if (!settlementMonth) continue;
+
+      // Check if this settlement's month overlaps with the batch's transaction months
+      const monthOverlap = batchMonths.has(settlementMonth);
+
+      // Also check direct transaction ID match (works if IDs haven't changed).
+      // `settled_transactions` mirrors the latest batch, so only fall back to it
+      // when structured batches are not present to avoid double-counting.
+      const matchedTxIds = new Set<string>();
+      if (settlement.settlement_batches?.length) {
+        for (const batch of settlement.settlement_batches) {
+          for (const snap of batch.transactions || []) {
+            if (batchTxIds.has(snap.id)) matchedTxIds.add(snap.id);
+          }
+        }
+      } else if (settlement.settled_transactions?.length) {
+        for (const snap of settlement.settled_transactions) {
+          if (batchTxIds.has(snap.id)) matchedTxIds.add(snap.id);
+        }
+      }
+      const idMatchCount = matchedTxIds.size;
+
+      if (monthOverlap || idMatchCount > 0) {
+        settledCount += idMatchCount || 1; // at least 1 for month overlap
+        affectedMonthsSet.add(settlement.month);
+        affectedSettlementIds.add(settlement.id);
+      }
+    }
+
+    // Find settlement payment transactions in this batch
+    const settlementPaymentCount = batchTxs.filter(
+      (t: Transaction) => t.transaction_type === SETTLEMENT_TRANSACTION_TYPE
+    ).length;
+
+      if (settlementPaymentCount > 0) {
+      const settlementPaymentIds = new Set(
+        batchTxs
+          .filter((t: Transaction) => t.transaction_type === SETTLEMENT_TRANSACTION_TYPE)
+          .map((t) => t.id)
+      );
+
+      // 1. Collect months from explicit payment_allocations on the transactions
+      for (const t of batchTxs) {
+        if (t.transaction_type !== SETTLEMENT_TRANSACTION_TYPE) continue;
+        if (t.payment_allocations?.length) {
+          for (const alloc of t.payment_allocations) {
+            affectedMonthsSet.add(alloc.month);
+            settledMonthsToReopen.add(alloc.month.slice(0, 7));
+          }
+        }
+      }
+
+      // 2. Scan all settled settlements for payment_refs that reference these
+      //    transactions — this catches months the payment was allocated to even
+      //    when the transaction itself doesn't carry payment_allocations.
+      for (const settlement of dataCache.settlements) {
+        const hasStoredSettledData =
+          settlement.is_settled ||
+          Boolean(settlement.settlement_batches?.length) ||
+          Boolean(settlement.settled_at && settlement.settled_transactions?.length);
+        if (!hasStoredSettledData) continue;
+
+        const settlementMonth = settlement.month?.slice(0, 7);
+        if (!settlementMonth) continue;
+
+        let referenced = false;
+        if (settlement.settlement_batches?.length) {
+          for (const batch of settlement.settlement_batches) {
+            for (const ref of batch.payment_refs || []) {
+              if (settlementPaymentIds.has(ref.transaction_id)) {
+                referenced = true;
+                break;
+              }
+            }
+            if (referenced) break;
+          }
+        }
+
+        if (referenced) {
+          affectedMonthsSet.add(settlement.month);
+          settledMonthsToReopen.add(settlementMonth);
+          affectedSettlementIds.add(settlement.id);
+        }
+      }
+
+      // 3. Fallback: if we found settlement payments but couldn't resolve any
+      //    specific months (no allocations, no payment_refs), flag ALL settled
+      //    settlements — the payment may have cleared any of them.
+      if (settledMonthsToReopen.size === 0) {
+        for (const settlement of dataCache.settlements) {
+          const hasStoredSettledData =
+            settlement.is_settled ||
+            Boolean(settlement.settlement_batches?.length) ||
+            Boolean(settlement.settled_at && settlement.settled_transactions?.length);
+          if (!hasStoredSettledData) continue;
+
+          const settlementMonth = settlement.month?.slice(0, 7);
+          if (!settlementMonth) continue;
+
+          affectedMonthsSet.add(settlement.month);
+          settledMonthsToReopen.add(settlementMonth);
+          affectedSettlementIds.add(settlement.id);
+        }
+      }
+    }
+
+    // Pick up any remaining settled settlements whose months we identified
+    if (settledMonthsToReopen.size > 0) {
+      for (const settlement of dataCache.settlements) {
+        const hasStoredSettledData =
+          settlement.is_settled ||
+          Boolean(settlement.settlement_batches?.length) ||
+          Boolean(settlement.settled_at && settlement.settled_transactions?.length);
+        if (!hasStoredSettledData) continue;
+
+        const settlementMonth = settlement.month?.slice(0, 7);
+        if (!settlementMonth || !settledMonthsToReopen.has(settlementMonth)) {
+          continue;
+        }
+
+        affectedSettlementIds.add(settlement.id);
+      }
+    }
+
+    return {
+      settledCount,
+      settlementPaymentCount,
+      affectedMonths: [...affectedMonthsSet].sort(),
+      affectedSettlementIds: [...affectedSettlementIds],
+    };
+  }
+
+  function handleDeleteBatch(batchId: string) {
+    const impact = analyzeSettlementImpact(batchId);
+
+    if ((impact.settledCount > 0 || impact.settlementPaymentCount > 0) && impact.affectedSettlementIds.length > 0) {
+      setDeleteBatchDialog({ batchId, ...impact });
+      return;
+    }
+
+    // No settlement impact — use simple confirm
     if (!confirm("Delete this upload and all its transactions? This cannot be undone.")) {
       return;
     }
+    executeDeleteBatch(batchId);
+  }
+
+  async function executeDeleteBatch(batchId: string) {
     setDeletingBatchId(batchId);
     try {
       const res = await fetch(`/api/upload-batches/${batchId}`, {
@@ -456,12 +807,14 @@ export default function UploadPage() {
       if (res.ok) {
         setBatches((prev) => prev.filter((b) => b.id !== batchId));
         await dataCache.refreshTransactions();
+        await dataCache.refreshSettlements();
         toast.success("Upload batch deleted");
       } else {
         const data = await res.json();
         toast.error(data.error || "Failed to delete batch");
       }
-    } catch {
+    } catch (err) {
+      console.error("[upload] executeDeleteBatch error:", err);
       toast.error("Failed to delete batch");
     } finally {
       setDeletingBatchId(null);
@@ -523,7 +876,7 @@ export default function UploadPage() {
           return;
         }
 
-        // Auto-categorize transactions using decrypted merchant rules
+        // Auto-categorize and auto-exclude transactions using decrypted merchant rules
         const rules = merchantRulesRef.current;
         if (rules.length > 0) {
           for (const result of results) {
@@ -534,9 +887,24 @@ export default function UploadPage() {
                   rules
                 );
               }
+              const excludeMatch = checkExcludeRule(t.description, t.amount, rules);
+              if (excludeMatch) {
+                t.isExcluded = true;
+                t.excludeRuleId = excludeMatch.id;
+              }
             }
           }
         }
+
+        // Build initial excludedIndices from exclude rules
+        const allParsedTxs = results.flatMap((r) => r.transactions);
+        const nonDupTxs = allParsedTxs.filter((t) => !t.isDuplicate);
+        const initialExcluded = new Set<number>();
+        nonDupTxs.forEach((t, i) => {
+          if (t.isExcluded) initialExcluded.add(i);
+        });
+        setExcludedIndices(initialExcluded);
+        setExcludeRuleSaved(new Set());
 
         setFileResults(results);
 
@@ -590,8 +958,76 @@ export default function UploadPage() {
 
   function clearAll() {
     setFileResults([]);
+    setExcludedIndices(new Set());
+    setExcludeRuleSaved(new Set());
+    setDateRange(undefined);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
+    }
+  }
+
+  async function saveExcludeRule(description: string, amount: number, nonDupIndex: number) {
+    setSavingExcludeRule(true);
+    try {
+      // Use the description as the pattern (escaped for regex safety)
+      const pattern = description.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const encrypted_data = await encryptFields(
+        {
+          pattern,
+          rule_type: "exclude",
+          notes: `Auto-created from upload exclusion: "${description}"`,
+          merchant_name: null,
+          merchant_type: null,
+          amount_hint: null,
+          amount_max: null,
+          match_transaction_type: null,
+        },
+        ["pattern", "rule_type", "notes", "merchant_name", "merchant_type", "amount_hint", "amount_max", "match_transaction_type"]
+      );
+
+      const res = await fetch("/api/merchant-rules", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          encrypted_data,
+          category_id: null,
+          priority: 0,
+          is_learned: true,
+          owner_user_id: currentUserId || undefined,
+        }),
+      });
+
+      if (res.ok) {
+        const createdRule = await res.json();
+        setExcludeRuleSaved((prev) => new Set([...prev, nonDupIndex]));
+        // Store the rule ID on the transaction so it can be deleted when toggling back
+        setFileResults((prev) =>
+          prev.map((result) => ({
+            ...result,
+            transactions: result.transactions.map((tx) =>
+              tx.description === description && tx.amount === amount && !tx.excludeRuleId
+                ? { ...tx, excludeRuleId: createdRule.id, isExcluded: true }
+                : tx
+            ),
+          }))
+        );
+        toast.success(`Exclusion rule saved for "${description.slice(0, 40)}${description.length > 40 ? "…" : ""}"`);
+        // Refresh merchant rules so it's immediately available
+        const rulesRes = await fetch("/api/merchant-rules");
+        if (rulesRes.ok) {
+          const dek = getDEK();
+          const rawRules = await rulesRes.json();
+          const rules = await decryptEntities(rawRules, dek) as unknown as MerchantRule[];
+          setMerchantRules(rules);
+          merchantRulesRef.current = rules;
+        }
+      } else {
+        toast.error("Failed to save exclusion rule");
+      }
+    } catch {
+      toast.error("Failed to save exclusion rule");
+    } finally {
+      setSavingExcludeRule(false);
     }
   }
 
@@ -615,12 +1051,20 @@ export default function UploadPage() {
       allOccurrenceMap.set(sig, count + 1);
     }
 
-    // Filter to truly new ones, carrying along their correct occurrence values
+    // Filter to truly new ones (excluding user-excluded + outside date range),
+    // carrying along their correct occurrence values
     const newWithOcc = dedupCheck && !dedupCheck.loading
       ? nonDupTransactions
           .map((t, i) => ({ t, occ: allOccurrences[i] }))
-          .filter((_, i) => dedupCheck.newIndices.has(i))
-      : nonDupTransactions.map((t, i) => ({ t, occ: allOccurrences[i] }));
+          .filter(
+            (_, i) =>
+              dedupCheck.newIndices.has(i) &&
+              !excludedIndices.has(i) &&
+              !outsideRangeIndices.has(i)
+          )
+      : nonDupTransactions
+          .map((t, i) => ({ t, occ: allOccurrences[i] }))
+          .filter((_, i) => !excludedIndices.has(i) && !outsideRangeIndices.has(i));
 
     if (newWithOcc.length === 0) {
       toast.error("No new transactions to import");
@@ -1019,11 +1463,52 @@ export default function UploadPage() {
                   </div>
                 </CardHeader>
                 <CardContent className="space-y-4">
+                  {/* Date range filter */}
+                  {preImportStats && (
+                    <div className="rounded-lg border bg-muted/30 p-3">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div className="space-y-0.5">
+                          <div className="text-xs font-medium text-foreground">
+                            Datumperiod att importera
+                          </div>
+                          <p className="text-[11px] text-muted-foreground">
+                            Välj från- och tilldatum. Transaktioner utanför perioden hoppas över.
+                            Filens intervall: {preImportStats.earliest} — {preImportStats.latest}.
+                          </p>
+                        </div>
+                        <DateRangePicker
+                          value={dateRange}
+                          onChange={setDateRange}
+                          defaultMonth={parseISODate(preImportStats.latest)}
+                          fromDate={parseISODate(preImportStats.earliest)}
+                          toDate={parseISODate(preImportStats.latest)}
+                          placeholder="Alla datum"
+                        />
+                      </div>
+                    </div>
+                  )}
+
                   {/* Top-level counts */}
                   {(() => {
                     const hasCheck = dedupCheck && !dedupCheck.loading;
-                    const willImport = hasCheck ? dedupCheck.willImport : newCount;
-                    const totalSkipped = hasCheck ? dedupCheck.skippedExact + dedupCheck.skippedLegacy : 0;
+                    const willImport = importableCount;
+                    // When a date range is active, all "counts in scope" reflect the range only.
+                    const inFileDisplay = rangeFiltered
+                      ? rangeFiltered.inFile
+                      : allTransactions.length;
+                    const dupDisplay = rangeFiltered ? rangeFiltered.duplicates : dupCount;
+                    const autoCatDisplay = rangeFiltered ? rangeFiltered.autoCat : autoCatCount;
+                    const skippedExactDisplay = rangeFiltered
+                      ? rangeFiltered.skippedExact
+                      : hasCheck
+                        ? dedupCheck.skippedExact
+                        : 0;
+                    const skippedLegacyDisplay = rangeFiltered
+                      ? rangeFiltered.skippedLegacy
+                      : hasCheck
+                        ? dedupCheck.skippedLegacy
+                        : 0;
+                    const totalSkipped = skippedExactDisplay + skippedLegacyDisplay;
 
                     return (
                       <>
@@ -1031,9 +1516,14 @@ export default function UploadPage() {
                           <div className="rounded-lg border p-3 space-y-1">
                             <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
                               <FileText className="h-3 w-3" />
-                              In file
+                              {rangeFiltered ? "In range" : "In file"}
                             </div>
-                            <p className="text-lg font-semibold">{allTransactions.length}</p>
+                            <p className="text-lg font-semibold">{inFileDisplay}</p>
+                            {rangeFiltered && (
+                              <p className="text-[11px] text-muted-foreground">
+                                of {allTransactions.length} in file
+                              </p>
+                            )}
                           </div>
                           <div className="rounded-lg border p-3 space-y-1">
                             <div className="flex items-center gap-1.5 text-xs text-green-600">
@@ -1048,6 +1538,30 @@ export default function UploadPage() {
                               ) : willImport}
                             </p>
                           </div>
+                          {importableExcluded > 0 && (
+                            <div className="rounded-lg border p-3 space-y-1">
+                              <div className="flex items-center gap-1.5 text-xs text-orange-600">
+                                <EyeOff className="h-3 w-3" />
+                                Excluded
+                              </div>
+                              <p className="text-lg font-semibold text-orange-600">{importableExcluded}</p>
+                              <p className="text-[11px] text-muted-foreground">
+                                Private — won&apos;t be shared
+                              </p>
+                            </div>
+                          )}
+                          {importableOutsideRange > 0 && (
+                            <div className="rounded-lg border p-3 space-y-1">
+                              <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                                <CalendarDays className="h-3 w-3" />
+                                Outside date range
+                              </div>
+                              <p className="text-lg font-semibold">{importableOutsideRange}</p>
+                              <p className="text-[11px] text-muted-foreground">
+                                Filtered out by date
+                              </p>
+                            </div>
+                          )}
                           {hasCheck && totalSkipped > 0 && (
                             <div className="rounded-lg border p-3 space-y-1">
                               <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -1056,26 +1570,26 @@ export default function UploadPage() {
                               </div>
                               <p className="text-lg font-semibold">{totalSkipped}</p>
                               <div className="space-y-0.5 pt-0.5">
-                                {dedupCheck.skippedExact > 0 && (
+                                {skippedExactDisplay > 0 && (
                                   <p className="text-[11px] text-muted-foreground" title="Exact hash match — this transaction was already imported with the same dedup key">
-                                    {dedupCheck.skippedExact} exact match
+                                    {skippedExactDisplay} exact match
                                   </p>
                                 )}
-                                {dedupCheck.skippedLegacy > 0 && (
+                                {skippedLegacyDisplay > 0 && (
                                   <p className="text-[11px] text-muted-foreground" title="Matched via old hash format (before account-aware dedup). This was the first occurrence that got imported previously.">
-                                    {dedupCheck.skippedLegacy} legacy match
+                                    {skippedLegacyDisplay} legacy match
                                   </p>
                                 )}
                               </div>
                             </div>
                           )}
-                          {dupCount > 0 && (
+                          {dupDisplay > 0 && (
                             <div className="rounded-lg border p-3 space-y-1">
                               <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
                                 <Copy className="h-3 w-3" />
                                 In-file duplicates
                               </div>
-                              <p className="text-lg font-semibold">{dupCount}</p>
+                              <p className="text-lg font-semibold">{dupDisplay}</p>
                             </div>
                           )}
                           {hasCheck && dedupCheck.totalInDb > 0 && (
@@ -1094,10 +1608,10 @@ export default function UploadPage() {
                           )}
                         </div>
 
-                        {autoCatCount > 0 && (
+                        {autoCatDisplay > 0 && (
                           <div className="flex items-center gap-1.5 text-xs text-blue-600">
                             <Zap className="h-3 w-3" />
-                            {autoCatCount} of {willImport} will be auto-categorized by merchant rules
+                            {autoCatDisplay} of {willImport} will be auto-categorized by merchant rules
                           </div>
                         )}
                       </>
@@ -1124,73 +1638,99 @@ export default function UploadPage() {
                       )}
 
                       {/* Date range + total sum */}
-                      <div className="flex flex-wrap gap-x-6 gap-y-2 text-sm">
-                        <div>
-                          <span className="text-muted-foreground text-xs">Date range</span>
-                          <p className="font-medium">
-                            {preImportStats.earliest} — {preImportStats.latest}
-                          </p>
-                        </div>
-                        <div>
-                          <span className="text-muted-foreground text-xs">Total sum (belopp)</span>
-                          <p className={`font-mono font-medium ${preImportStats.totalSum >= 0 ? "text-green-600" : "text-red-600"}`}>
-                            {formatCurrency(preImportStats.totalSum)}
-                          </p>
-                        </div>
-                      </div>
+                      {(() => {
+                        const totalSumDisplay = rangeFiltered
+                          ? rangeFiltered.totalSum
+                          : preImportStats.totalSum;
+                        const rangeLabel = rangeFiltered && (dateRangeFromStr || dateRangeToStr)
+                          ? `${dateRangeFromStr ?? "…"} — ${dateRangeToStr ?? "…"}`
+                          : `${preImportStats.earliest} — ${preImportStats.latest}`;
+                        return (
+                          <div className="flex flex-wrap gap-x-6 gap-y-2 text-sm">
+                            <div>
+                              <span className="text-muted-foreground text-xs">
+                                {rangeFiltered ? "Selected range" : "Date range"}
+                              </span>
+                              <p className="font-medium">{rangeLabel}</p>
+                            </div>
+                            <div>
+                              <span className="text-muted-foreground text-xs">
+                                Total sum (belopp){rangeFiltered ? " — in range" : ""}
+                              </span>
+                              <p className={`font-mono font-medium ${totalSumDisplay >= 0 ? "text-green-600" : "text-red-600"}`}>
+                                {formatCurrency(totalSumDisplay)}
+                              </p>
+                            </div>
+                          </div>
+                        );
+                      })()}
 
                       {/* Monthly sums */}
-                      {preImportStats.monthlySums.length > 0 && (
-                        <div className="rounded-lg border p-3">
-                          <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-2">
-                            <span className="font-medium">Total sum of belopp</span>
-                            <button
-                              type="button"
-                              className="group relative"
-                              title="Compare these sums against your bank statements for the same months to verify all transactions were imported correctly."
-                            >
-                              <Info className="h-3 w-3 text-muted-foreground/60 hover:text-muted-foreground" />
-                              <span className="absolute left-1/2 -translate-x-1/2 bottom-full mb-1.5 w-56 rounded-md bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md border opacity-0 pointer-events-none group-focus:opacity-100 group-focus:pointer-events-auto sm:group-hover:opacity-100 sm:group-hover:pointer-events-auto z-50 text-left">
-                                Compare these sums against your bank statements for the same months to verify all transactions were imported correctly.
+                      {(() => {
+                        const monthlySumsDisplay = rangeFiltered
+                          ? rangeFiltered.monthlySums
+                          : preImportStats.monthlySums;
+                        if (monthlySumsDisplay.length === 0) return null;
+                        return (
+                          <div className="rounded-lg border p-3">
+                            <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-2">
+                              <span className="font-medium">
+                                Total sum of belopp{rangeFiltered ? " (in range)" : ""}
                               </span>
-                            </button>
+                              <button
+                                type="button"
+                                className="group relative"
+                                title="Compare these sums against your bank statements for the same months to verify all transactions were imported correctly."
+                              >
+                                <Info className="h-3 w-3 text-muted-foreground/60 hover:text-muted-foreground" />
+                                <span className="absolute left-1/2 -translate-x-1/2 bottom-full mb-1.5 w-56 rounded-md bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md border opacity-0 pointer-events-none group-focus:opacity-100 group-focus:pointer-events-auto sm:group-hover:opacity-100 sm:group-hover:pointer-events-auto z-50 text-left">
+                                  Compare these sums against your bank statements for the same months to verify all transactions were imported correctly.
+                                </span>
+                              </button>
+                            </div>
+                            <div className="flex flex-wrap gap-6">
+                              {monthlySumsDisplay.map((ms) => {
+                                const [y, m] = ms.month.split("-");
+                                const monthLabel = new Date(Number(y), Number(m) - 1).toLocaleDateString("sv-SE", {
+                                  year: "numeric",
+                                  month: "long",
+                                });
+                                return (
+                                  <div key={ms.month} className="space-y-0.5">
+                                    <p className="text-xs text-muted-foreground capitalize">{monthLabel}</p>
+                                    <p className={`text-sm font-mono font-medium ${ms.sum >= 0 ? "text-green-600" : "text-red-600"}`}>
+                                      {formatCurrency(ms.sum)}
+                                    </p>
+                                  </div>
+                                );
+                              })}
+                            </div>
                           </div>
-                          <div className="flex flex-wrap gap-6">
-                            {preImportStats.monthlySums.map((ms) => {
-                              const [y, m] = ms.month.split("-");
-                              const monthLabel = new Date(Number(y), Number(m) - 1).toLocaleDateString("sv-SE", {
-                                year: "numeric",
-                                month: "long",
-                              });
-                              return (
-                                <div key={ms.month} className="space-y-0.5">
-                                  <p className="text-xs text-muted-foreground capitalize">{monthLabel}</p>
-                                  <p className={`text-sm font-mono font-medium ${ms.sum >= 0 ? "text-green-600" : "text-red-600"}`}>
-                                    {formatCurrency(ms.sum)}
-                                  </p>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      )}
+                        );
+                      })()}
 
                       {/* Per-account breakdown */}
-                      {preImportStats.accounts.length > 1 && (
-                        <div className="rounded-lg border p-3">
-                          <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-2">
-                            <Database className="h-3 w-3" />
-                            Transactions per account (in file)
+                      {(() => {
+                        const accountsDisplay = rangeFiltered
+                          ? rangeFiltered.accounts
+                          : preImportStats.accounts;
+                        if (accountsDisplay.length <= 1) return null;
+                        return (
+                          <div className="rounded-lg border p-3">
+                            <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-2">
+                              <Database className="h-3 w-3" />
+                              Transactions per account{rangeFiltered ? " (in range)" : " (in file)"}
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              {accountsDisplay.map((acc) => (
+                                <Badge key={acc.name} variant="outline" className="text-xs font-normal">
+                                  {acc.name} <span className="ml-1 font-semibold">{acc.count}</span>
+                                </Badge>
+                              ))}
+                            </div>
                           </div>
-                          <div className="flex flex-wrap gap-2">
-                            {preImportStats.accounts.map((acc) => (
-                              <Badge key={acc.name} variant="outline" className="text-xs font-normal">
-                                {acc.name} <span className="ml-1 font-semibold">{acc.count}</span>
-                              </Badge>
-                            ))}
-                          </div>
-                        </div>
-                      )}
+                        );
+                      })()}
                     </>
                   )}
 
@@ -1209,10 +1749,18 @@ export default function UploadPage() {
                         </option>
                       ))}
                     </select>
-                    <div className="ml-auto">
+                    <div className="ml-auto flex items-center gap-2">
+                      <Button
+                        variant="outline"
+                        onClick={clearAll}
+                        disabled={importing}
+                      >
+                        <Trash2 className="mr-2 h-4 w-4" />
+                        Discard
+                      </Button>
                       <Button
                         onClick={handleImport}
-                        disabled={importing || newCount === 0 || dedupCheck?.loading}
+                        disabled={importing || dedupCheck?.loading || importableCount <= 0}
                         size="lg"
                       >
                         <Upload className="mr-2 h-4 w-4" />
@@ -1220,9 +1768,7 @@ export default function UploadPage() {
                           ? "Importing..."
                           : dedupCheck?.loading
                             ? "Checking..."
-                            : dedupCheck && !dedupCheck.loading
-                              ? `Import ${dedupCheck.willImport} transactions`
-                              : `Import ${newCount} transactions`}
+                            : `Import ${importableCount} transaction${importableCount !== 1 ? "s" : ""}`}
                       </Button>
                     </div>
                   </div>
@@ -1233,29 +1779,44 @@ export default function UploadPage() {
               {(() => {
                 const hasCheck = dedupCheck && !dedupCheck.loading;
                 const nonDup = allTransactions.filter((t) => !t.isDuplicate);
-                const previewTxs = hasCheck
-                  ? nonDup.filter((_, i) => dedupCheck.newIndices.has(i))
-                  : nonDup;
-                const previewSorted = [...previewTxs].sort((a, b) => b.date.localeCompare(a.date));
+                // Keep original nonDup index alongside each transaction
+                const previewWithIdx = hasCheck
+                  ? nonDup.map((t, i) => ({ t, nonDupIdx: i })).filter(({ nonDupIdx }) => dedupCheck.newIndices.has(nonDupIdx))
+                  : nonDup.map((t, i) => ({ t, nonDupIdx: i }));
+                const previewSorted = [...previewWithIdx].sort((a, b) => b.t.date.localeCompare(a.t.date));
                 const previewLabel = hasCheck
-                  ? `${previewTxs.length} new transactions to import`
-                  : `${previewTxs.length} transactions`;
+                  ? `${previewWithIdx.length} new transactions to import`
+                  : `${previewWithIdx.length} transactions`;
 
                 return previewSorted.length > 0 ? (
                   <Card>
                     <CardHeader>
-                      <CardTitle className="flex items-center gap-2">
-                        Preview
-                        <Badge variant="outline" className="text-xs font-normal">
-                          {previewLabel}
-                        </Badge>
-                      </CardTitle>
+                      <div className="flex items-center justify-between">
+                        <CardTitle className="flex items-center gap-2">
+                          Preview
+                          <Badge variant="outline" className="text-xs font-normal">
+                            {previewLabel}
+                          </Badge>
+                        </CardTitle>
+                        {importableExcluded > 0 && (
+                          <div className="flex items-center gap-1.5 text-xs text-orange-600">
+                            <EyeOff className="h-3 w-3" />
+                            {importableExcluded} excluded
+                          </div>
+                        )}
+                      </div>
                     </CardHeader>
                     <CardContent>
                       <div className="overflow-x-auto">
                         <Table>
                           <TableHeader>
                             <TableRow>
+                              <TableHead className="w-[50px]">
+                                <span className="flex items-center gap-1 text-xs">
+                                  <EyeOff className="h-3 w-3" />
+                                  Private
+                                </span>
+                              </TableHead>
                               <TableHead>Date</TableHead>
                               <TableHead>Description</TableHead>
                               <TableHead className="text-right">Amount</TableHead>
@@ -1264,41 +1825,148 @@ export default function UploadPage() {
                             </TableRow>
                           </TableHeader>
                           <TableBody>
-                            {previewSorted.map((t, i) => (
-                              <TableRow key={i}>
-                                <TableCell className="whitespace-nowrap">
-                                  {t.date.slice(0, 10)}
-                                </TableCell>
-                                <TableCell className="max-w-[300px] truncate">
-                                  {t.description}
-                                  {t.autoCategory && (
-                                    <Badge
-                                      variant="outline"
-                                      className="ml-2 text-xs"
+                            {previewSorted.map(({ t, nonDupIdx }) => {
+                              const isExcluded = excludedIndices.has(nonDupIdx);
+                              const isOutsideRange = outsideRangeIndices.has(nonDupIdx);
+                              return (
+                                <TableRow
+                                  key={nonDupIdx}
+                                  className={isExcluded || isOutsideRange ? "opacity-40" : ""}
+                                >
+                                  <TableCell>
+                                    <button
+                                      type="button"
+                                      title={isExcluded ? "Include this transaction" : "Exclude this transaction"}
+                                      onClick={async () => {
+                                        const wasExcluded = excludedIndices.has(nonDupIdx);
+                                        // All same-name transactions in this upload
+                                        const sameNameEntries = previewWithIdx
+                                          .filter(({ t: other }) => other.description === t.description);
+                                        const sameNameIndices = sameNameEntries.map(({ nonDupIdx: idx }) => idx);
+
+                                        if (!wasExcluded) {
+                                          // EXCLUDING — exclude ALL same-name + create rule
+                                          setExcludedIndices((prev) => {
+                                            const next = new Set(prev);
+                                            for (const idx of sameNameIndices) next.add(idx);
+                                            return next;
+                                          });
+                                          if (!t.excludeRuleId) {
+                                            await saveExcludeRule(t.description, t.amount, nonDupIdx);
+                                          }
+                                        } else {
+                                          // UN-EXCLUDING — only this one transaction
+                                          setExcludedIndices((prev) => {
+                                            const next = new Set(prev);
+                                            next.delete(nonDupIdx);
+                                            return next;
+                                          });
+
+                                          // Check if this was the last same-name excluded
+                                          const othersStillExcluded = sameNameIndices.some(
+                                            (idx) => idx !== nonDupIdx && excludedIndices.has(idx)
+                                          );
+
+                                          if (!othersStillExcluded) {
+                                            // Last one — delete the rule
+                                            const ruleIds = new Set<string>();
+                                            for (const { t: other } of sameNameEntries) {
+                                              if (other.excludeRuleId) ruleIds.add(other.excludeRuleId);
+                                            }
+                                            for (const deleteId of ruleIds) {
+                                              try {
+                                                await fetch(`/api/merchant-rules?id=${deleteId}`, { method: "DELETE" });
+                                              } catch {
+                                                toast.error("Failed to remove exclusion rule");
+                                              }
+                                            }
+                                            if (ruleIds.size > 0) {
+                                              setFileResults((prev) =>
+                                                prev.map((result) => ({
+                                                  ...result,
+                                                  transactions: result.transactions.map((tx) =>
+                                                    tx.description === t.description
+                                                      ? { ...tx, excludeRuleId: undefined, isExcluded: false }
+                                                      : tx
+                                                  ),
+                                                }))
+                                              );
+                                              const rulesRes = await fetch("/api/merchant-rules");
+                                              if (rulesRes.ok) {
+                                                const dek = getDEK();
+                                                const rawRules = await rulesRes.json();
+                                                const rules = await decryptEntities(rawRules, dek) as unknown as MerchantRule[];
+                                                setMerchantRules(rules);
+                                                merchantRulesRef.current = rules;
+                                              }
+                                              toast.success("Exclusion rule removed");
+                                            }
+                                          }
+                                          setExcludeRuleSaved((prev) => {
+                                            const next = new Set(prev);
+                                            next.delete(nonDupIdx);
+                                            return next;
+                                          });
+                                        }
+                                      }}
+                                      className={`flex h-7 w-7 items-center justify-center rounded-md border transition-colors ${
+                                        isExcluded
+                                          ? "border-orange-300 bg-orange-50 text-orange-500 hover:bg-orange-100 dark:border-orange-800 dark:bg-orange-950/50 dark:text-orange-400 dark:hover:bg-orange-950"
+                                          : "border-green-300 bg-green-50 text-green-600 hover:bg-green-100 dark:border-green-800 dark:bg-green-950/50 dark:text-green-400 dark:hover:bg-green-950"
+                                      }`}
                                     >
-                                      {categoryMap.get(t.autoCategory) || "Auto"}
-                                    </Badge>
-                                  )}
-                                </TableCell>
-                                <TableCell className="text-right font-mono">
-                                  {formatCurrency(t.amount)}
-                                </TableCell>
-                                <TableCell>
-                                  {t.transaction_type && (
-                                    <Badge variant="secondary" className="text-xs">
-                                      {t.transaction_type}
-                                    </Badge>
-                                  )}
-                                </TableCell>
-                                <TableCell>
-                                  {t.bank_name && (
-                                    <span className="text-xs text-muted-foreground">
-                                      {t.bank_name} {t.account_number || ""}
-                                    </span>
-                                  )}
-                                </TableCell>
-                              </TableRow>
-                            ))}
+                                      {isExcluded ? (
+                                        <EyeOff className="h-3.5 w-3.5" />
+                                      ) : (
+                                        <Eye className="h-3.5 w-3.5" />
+                                      )}
+                                    </button>
+                                  </TableCell>
+                                  <TableCell className="whitespace-nowrap">
+                                    {t.date.slice(0, 10)}
+                                    {isOutsideRange && (
+                                      <Badge variant="outline" className="ml-2 text-xs text-muted-foreground">
+                                        <CalendarDays className="mr-1 h-3 w-3" />
+                                        Utanför period
+                                      </Badge>
+                                    )}
+                                  </TableCell>
+                                  <TableCell className="max-w-[300px] truncate">
+                                    {t.description}
+                                    {t.autoCategory && !isExcluded && !isOutsideRange && (
+                                      <Badge
+                                        variant="outline"
+                                        className="ml-2 text-xs"
+                                      >
+                                        {categoryMap.get(t.autoCategory) || "Auto"}
+                                      </Badge>
+                                    )}
+                                    {isExcluded && t.excludeRuleId && (
+                                      <Badge variant="outline" className="ml-2 text-xs text-orange-600 border-orange-300">
+                                        Auto-excluded
+                                      </Badge>
+                                    )}
+                                  </TableCell>
+                                  <TableCell className="text-right font-mono">
+                                    {formatCurrency(t.amount)}
+                                  </TableCell>
+                                  <TableCell>
+                                    {t.transaction_type && (
+                                      <Badge variant="secondary" className="text-xs">
+                                        {t.transaction_type}
+                                      </Badge>
+                                    )}
+                                  </TableCell>
+                                  <TableCell>
+                                    {t.bank_name && (
+                                      <span className="text-xs text-muted-foreground">
+                                        {t.bank_name} {t.account_number || ""}
+                                      </span>
+                                    )}
+                                  </TableCell>
+                                </TableRow>
+                              );
+                            })}
                           </TableBody>
                         </Table>
                       </div>
@@ -1613,6 +2281,84 @@ export default function UploadPage() {
         </CardContent>
       </Card>
 
+      {/* Delete blocked — settlements must be reopened first */}
+      <Dialog
+        open={!!deleteBatchDialog}
+        onOpenChange={(open) => {
+          if (!open) setDeleteBatchDialog(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-destructive">
+              <AlertTriangle className="h-5 w-5" />
+              Reopen settlements first
+            </DialogTitle>
+            <DialogDescription>
+              This upload contains transactions linked to settled months.
+              You must reopen the affected settlements before you can delete this upload.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <ul className="space-y-2 text-sm">
+              {(deleteBatchDialog?.settledCount ?? 0) > 0 && (
+                <li className="flex items-start gap-2">
+                  <span className="mt-0.5 shrink-0 rounded-full bg-amber-100 p-1 dark:bg-amber-900">
+                    <AlertTriangle className="h-3 w-3 text-amber-600 dark:text-amber-400" />
+                  </span>
+                  <span>
+                    <strong>{deleteBatchDialog?.settledCount}</strong> transaction{deleteBatchDialog?.settledCount === 1 ? "" : "s"} belong{deleteBatchDialog?.settledCount === 1 ? "s" : ""} to
+                    settled month{deleteBatchDialog?.affectedMonths.length === 1 ? "" : "s"}.
+                  </span>
+                </li>
+              )}
+              {(deleteBatchDialog?.settlementPaymentCount ?? 0) > 0 && (
+                <li className="flex items-start gap-2">
+                  <span className="mt-0.5 shrink-0 rounded-full bg-amber-100 p-1 dark:bg-amber-900">
+                    <AlertTriangle className="h-3 w-3 text-amber-600 dark:text-amber-400" />
+                  </span>
+                  <span>
+                    <strong>{deleteBatchDialog?.settlementPaymentCount}</strong> settlement payment{deleteBatchDialog?.settlementPaymentCount === 1 ? "" : "s"}{" "}
+                    target{deleteBatchDialog?.settlementPaymentCount === 1 ? "s" : ""} settled month{deleteBatchDialog?.affectedMonths.length === 1 ? "" : "s"}.
+                  </span>
+                </li>
+              )}
+            </ul>
+            {(deleteBatchDialog?.affectedMonths?.length ?? 0) > 0 && (
+              <div className="rounded-md border bg-muted/50 p-2.5">
+                <p className="text-xs font-medium text-muted-foreground mb-1">Months to reopen</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {deleteBatchDialog?.affectedMonths.map((m) => (
+                    <Badge key={m} variant="outline" className="text-xs">
+                      {m}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            )}
+            <div className="rounded-md border border-amber-200 bg-amber-50/80 p-2.5 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+              Go to{" "}
+              <Link href="/dashboard/settlements" className="font-medium underline underline-offset-2 hover:text-amber-700 dark:hover:text-amber-100">
+                Settlements
+              </Link>{" "}
+              and use <strong>Reopen Latest Settled Batch</strong> on each month listed above, then come back to delete this upload.
+            </div>
+          </div>
+          <DialogFooter>
+            <DialogClose
+              render={<Button variant="outline" />}
+            >
+              Cancel
+            </DialogClose>
+            <Button
+              render={<Link href="/dashboard/settlements" />}
+            >
+              Go to Settlements
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Delete All confirmation dialog */}
       <Dialog
         open={showDeleteAllDialog}
@@ -1660,6 +2406,7 @@ export default function UploadPage() {
                     setBatches([]);
                     setDedupCheck(null);
                     await dataCache.refreshTransactions();
+                    await dataCache.refreshSettlements();
                     toast.success("All transactions and batches deleted. Ready for clean re-import.");
                   } else {
                     const d = await res.json();

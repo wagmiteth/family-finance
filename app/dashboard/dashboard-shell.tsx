@@ -29,7 +29,7 @@ import {
   LogOut,
   User,
 } from "lucide-react";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useId } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import { decryptEntity } from "@/lib/crypto/entity-crypto";
@@ -100,6 +100,8 @@ export function DashboardShell({
   const router = useRouter();
   const [mobileOpen, setMobileOpen] = useState(false);
   const { isUnlocked, lock } = useEncryption();
+  const mobileMenuTriggerId = useId();
+  const accountMenuTriggerId = useId();
 
   // Decrypted state
   const [userName, setUserName] = useState(rawUser.email as string || "");
@@ -145,8 +147,13 @@ export function DashboardShell({
       <header className="sticky top-0 z-30 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
         <div className="flex h-14 items-center gap-4 px-4 md:px-6">
           {/* Mobile hamburger */}
-          <Sheet open={mobileOpen} onOpenChange={setMobileOpen}>
+          <Sheet
+            open={mobileOpen}
+            onOpenChange={setMobileOpen}
+            triggerId={mobileMenuTriggerId}
+          >
             <SheetTrigger
+              id={mobileMenuTriggerId}
               render={
                 <Button variant="ghost" size="icon" className="shrink-0 md:hidden">
                   <Menu className="h-5 w-5" />
@@ -191,8 +198,9 @@ export function DashboardShell({
           <div className="flex-1 md:hidden" />
 
           {/* User menu */}
-          <DropdownMenu>
+          <DropdownMenu triggerId={accountMenuTriggerId}>
             <DropdownMenuTrigger
+              id={accountMenuTriggerId}
               className={cn(
                 "flex items-center gap-2 rounded-full p-0.5 transition-colors hover:bg-accent focus:outline-none",
                 pathname === "/dashboard/account" && "ring-2 ring-primary ring-offset-2"

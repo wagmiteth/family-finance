@@ -76,3 +76,25 @@ export function autoCategorize(
 
   return null;
 }
+
+/**
+ * Check if a transaction should be excluded during import.
+ * Returns the matching exclude rule if found, null otherwise.
+ */
+export function checkExcludeRule(
+  description: string,
+  amount: number,
+  rules: MerchantRule[]
+): MerchantRule | null {
+  const excludeRules = rules
+    .filter((r) => r.rule_type === "exclude")
+    .sort((a, b) => b.priority - a.priority);
+
+  for (const rule of excludeRules) {
+    if (matchPatternRule(rule, description, amount)) {
+      return rule;
+    }
+  }
+
+  return null;
+}

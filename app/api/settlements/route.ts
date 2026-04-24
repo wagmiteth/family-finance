@@ -72,17 +72,8 @@ export async function POST(request: Request) {
       );
     }
 
-    if (typeof body.settlement_hash !== "string") {
-      return NextResponse.json(
-        { error: "settlement_hash is required" },
-        { status: 400 }
-      );
-    }
-
-    // Upsert by settlement_hash (client-computed SHA-256 of household_id + month)
     const settlementPayload: Record<string, unknown> = {
       household_id: appUser.household_id,
-      settlement_hash: body.settlement_hash,
       encrypted_data: body.encrypted_data,
       is_settled: body.is_settled ?? false,
     };
@@ -94,10 +85,7 @@ export async function POST(request: Request) {
 
     const { data: settlement, error } = await supabase
       .from("settlements")
-      .upsert(
-        settlementPayload,
-        { onConflict: "household_id,settlement_hash" }
-      )
+      .insert(settlementPayload)
       .select()
       .single();
 

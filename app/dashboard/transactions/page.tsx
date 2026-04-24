@@ -52,9 +52,11 @@ import {
   ArrowUpDown,
   ArrowUp,
   ArrowDown,
+  StickyNote,
 } from "lucide-react";
 import { toast } from "sonner";
 import type { Transaction, Category, User, MerchantRule, Settlement } from "@/lib/types";
+import { getStoredAnthropicApiKey } from "@/lib/crypto/anthropic-api-key";
 import { encryptMerchantRule, encryptTransaction } from "@/lib/crypto/entity-crypto";
 import { useData } from "@/lib/crypto/data-provider";
 import { hasCategoryOrderMarker, setCategoryOrderMarker } from "@/lib/category-order";
@@ -84,16 +86,40 @@ function getTransactionAmountClassName(amount: number) {
     : "text-muted-foreground";
 }
 
-function getSettledTransactionIds(settlements: Settlement[]) {
+function getSettledTransactionIds(
+  settlements: Settlement[],
+  liveTransactionIds: Set<string>
+) {
   const ids = new Set<string>();
 
   for (const settlement of settlements) {
+    if (!settlement.is_settled) {
+      continue;
+    }
+
     if (settlement.settlement_batches?.length) {
+      const hasMissingSnapshotTransaction = settlement.settlement_batches.some(
+        (batch) =>
+          batch.transactions.some(
+            (transaction) => !liveTransactionIds.has(transaction.id)
+          )
+      );
+      if (hasMissingSnapshotTransaction) {
+        continue;
+      }
+
       for (const batch of settlement.settlement_batches) {
         for (const transaction of batch.transactions || []) {
           ids.add(transaction.id);
         }
       }
+      continue;
+    }
+
+    const hasMissingSnapshotTransaction = (settlement.settled_transactions || []).some(
+      (transaction) => !liveTransactionIds.has(transaction.id)
+    );
+    if (hasMissingSnapshotTransaction) {
       continue;
     }
 
@@ -297,7 +323,22 @@ function TransactionCard({
                 · {transaction.enriched_info}
               </span>
             )}
-            {transaction.bank_name && !transaction.enriched_info && (
+            {!transaction.enriched_info && transaction.notes && (
+              <button
+                type="button"
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onClickDetail(transaction);
+                }}
+                className="inline-flex items-center gap-1 max-w-[240px] cursor-pointer text-[10px] text-muted-foreground italic hover:text-foreground hover:underline"
+                title={`${transaction.notes}\n\nClick to edit`}
+              >
+                <StickyNote className="h-2.5 w-2.5 shrink-0" />
+                <span className="truncate">{transaction.notes}</span>
+              </button>
+            )}
+            {!transaction.enriched_info && !transaction.notes && transaction.bank_name && (
               <span className="text-[10px] text-muted-foreground/70">
                 · {transaction.bank_name}
               </span>
@@ -711,7 +752,14 @@ export default function TransactionsPage() {
   const categoryOrderCustomized =
     data.household?.category_order_customized ?? false;
   const merchantRules = data.merchantRules;
-  const settledTransactionIds = getSettledTransactionIds(data.settlements);
+  const liveTransactionIds = useMemo(
+    () => new Set(data.transactions.map((transaction) => transaction.id)),
+    [data.transactions]
+  );
+  const settledTransactionIds = getSettledTransactionIds(
+    data.settlements,
+    liveTransactionIds
+  );
   const loading = data.loading && data.lastFetched === 0;
   const [userFilter, setUserFilter] = useState<string>("all");
   const [sortField, setSortField] = useState<"date" | "description" | "amount">("date");
@@ -1040,7 +1088,18 @@ export default function TransactionsPage() {
           : t
       )
     );
-    setSelectedIds(new Set());
+    // Only drop the moved IDs from the selection. Untouched marked cards
+    // stay marked so the user can keep operating on a multi-selection
+    // while moving individual unselected cards.
+    setSelectedIds((prev) => {
+      if (prev.size === 0) return prev;
+      const next = new Set(prev);
+      let changed = false;
+      for (const id of mutableIds) {
+        if (next.delete(id)) changed = true;
+      }
+      return changed ? next : prev;
+    });
 
     // API call in background
     try {
@@ -1069,7 +1128,6 @@ export default function TransactionsPage() {
 
       // Auto-create/update merchant rules (skip for Deleted/Uncategorized, but include Exclude)
       const targetCat = categories.find((c) => c.id === resolvedTargetId);
-      const isExclude = targetCat?.name === "exclude";
       const isDeleted = targetCat?.name === "deleted";
       const skipAutoLearn = !resolvedTargetId || isDeleted;
 
@@ -1243,22 +1301,32 @@ export default function TransactionsPage() {
         );
 
         const categoryMap = new Map(categories.map((c) => [c.id, c.name || c.display_name || "Unknown"]));
+        const userMap = new Map(users.map((u) => [u.id, u.name || "Unknown"]));
+        // Resolve against the freshest local state so the toast matches the card's avatar.
+        // `uncategorizedTxs` is a snapshot taken at the top of handleAutoSort; `transactions`
+        // is the latest React state and also what the cards render from.
+        const txById = new Map(transactions.map((t) => [t.id, t]));
         const lines = matches.map((m) => {
-          const tx = uncategorizedTxs.find((t) => t.id === m.transactionId);
+          const tx = txById.get(m.transactionId) ?? uncategorizedTxs.find((t) => t.id === m.transactionId);
           const desc = tx?.description || "Unknown";
           const cat = categoryMap.get(m.categoryId) || "Unknown";
-          return { desc, cat };
+          const payer = tx?.user_id ? userMap.get(tx.user_id) : null;
+          return { desc, cat, payer };
         });
         const sortedIds = matches.map((m) => m.transactionId);
         toast.success(`Auto-sorted ${successCount} transaction${successCount > 1 ? "s" : ""}`, {
           description: (
             <ul className="mt-1 space-y-0.5 text-xs">
               {lines.map((l, i) => (
-                <li key={i}>{l.desc} → <span className="font-medium">{l.cat}</span></li>
+                <li key={i}>
+                  {l.desc} → <span className="font-medium">{l.cat}</span>
+                  {l.payer && (
+                    <span className="text-muted-foreground"> · {l.payer}</span>
+                  )}
+                </li>
               ))}
             </ul>
           ),
-          duration: 8000,
           action: {
             label: "Undo",
             onClick: async () => {
@@ -1304,10 +1372,17 @@ export default function TransactionsPage() {
   async function handleEnrich(tx: Transaction) {
     setEnriching(true);
     try {
+      const apiKey = await getStoredAnthropicApiKey();
+      if (!apiKey) {
+        toast.error("No API key configured. Add one in Settings.");
+        return;
+      }
+
       const res = await fetch("/api/enrich", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          apiKey,
           transactionIds: [tx.id],
           descriptions: [{ id: tx.id, name: tx.description, amount: tx.amount }],
         }),
@@ -1349,8 +1424,10 @@ export default function TransactionsPage() {
       } else {
         toast.error("Enrichment failed");
       }
-    } catch {
-      toast.error("Failed to enrich transaction");
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to enrich transaction"
+      );
     } finally {
       setEnriching(false);
     }
@@ -1413,7 +1490,6 @@ export default function TransactionsPage() {
         toast.success(
           `Marked as settlement payment and moved to ${excludeCat?.display_name || "Exclude"}.`,
           {
-            duration: 5000,
             action: {
               label: "Settlement history",
               onClick: () => window.location.assign("/dashboard/settlements"),
@@ -1489,7 +1565,16 @@ export default function TransactionsPage() {
     setTransactions((prev) =>
       prev.map((t) => (mutableIds.includes(t.id) ? { ...t, category_id: categoryId } : t))
     );
-    setSelectedIds(new Set());
+    // Only drop the moved IDs from the selection — see handleDragEnd for why.
+    setSelectedIds((prev) => {
+      if (prev.size === 0) return prev;
+      const next = new Set(prev);
+      let changed = false;
+      for (const id of mutableIds) {
+        if (next.delete(id)) changed = true;
+      }
+      return changed ? next : prev;
+    });
 
     try {
       const res = await fetch("/api/transactions/bulk", {

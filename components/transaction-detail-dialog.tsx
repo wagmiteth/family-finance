@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Banknote, Loader2, Sparkles, Undo2 } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
@@ -81,17 +81,28 @@ export function TransactionDetailDialog({
   const [notes, setNotes] = useState("");
   const [savingNotes, setSavingNotes] = useState(false);
   const [selectedCategoryId, setSelectedCategoryId] = useState("");
-  const selectableCategories = excludeDeletedCategory(categories);
+  const selectableCategories = useMemo(
+    () => excludeDeletedCategory(categories),
+    [categories]
+  );
+
+  // Only reset local state when a different transaction is opened, or when the
+  // current transaction's persisted notes/category change on the server.
+  // Depending on `selectableCategories` here caused the notes field to be
+  // overwritten on every keystroke because a new filtered array reference was
+  // created on each render.
+  const transactionId = transaction?.id;
+  const persistedNotes = transaction?.notes ?? null;
+  const persistedCategoryId = transaction?.category_id ?? null;
 
   useEffect(() => {
-    if (transaction) {
-      setNotes(transaction.notes || "");
-      const selectedCategory = selectableCategories.find(
-        (category) => category.id === transaction.category_id
-      );
-      setSelectedCategoryId(selectedCategory?.id || "");
-    }
-  }, [transaction, selectableCategories]);
+    if (!transactionId) return;
+    setNotes(persistedNotes || "");
+    const selectedCategory = selectableCategories.find(
+      (category) => category.id === persistedCategoryId
+    );
+    setSelectedCategoryId(selectedCategory?.id || "");
+  }, [transactionId, persistedNotes, persistedCategoryId, selectableCategories]);
 
   if (!transaction) return null;
 

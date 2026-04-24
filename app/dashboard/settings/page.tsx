@@ -65,11 +65,16 @@ import type {
   MerchantRule,
   Transaction,
 } from "@/lib/types";
-import { useDecryptedFetch } from "@/lib/crypto/use-decrypted-fetch";
 import { useData } from "@/lib/crypto/data-provider";
 import { setCategoryOrderMarker } from "@/lib/category-order";
 import { excludeDeletedCategory, isDeletedCategory } from "@/lib/categories";
 import { decryptEntity, decryptEntities, encryptCategory, encryptMerchantRule } from "@/lib/crypto/entity-crypto";
+import {
+  encryptAnthropicApiKey,
+  getStoredAnthropicApiKey,
+  getStoredAnthropicApiKeySummary,
+  maskAnthropicApiKey,
+} from "@/lib/crypto/anthropic-api-key";
 import { getDEK } from "@/lib/crypto/key-store";
 import { InviteBanner } from "@/components/invite-banner";
 
@@ -1079,38 +1084,56 @@ function MerchantRulesTab() {
 function ApiKeyTab() {
   const [apiKey, setApiKey] = useState("");
   const [maskedKey, setMaskedKey] = useState<string | null>(null);
+  const [storedKeyNeedsResave, setStoredKeyNeedsResave] = useState(false);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
+    let active = true;
+
     async function loadKey() {
-      const res = await fetch("/api/user/settings");
-      if (res.ok) {
-        const data = await res.json();
-        if (data.has_api_key && data.masked_api_key) {
-          setMaskedKey(data.masked_api_key);
+      try {
+        const summary = await getStoredAnthropicApiKeySummary();
+        if (!active) return;
+        setMaskedKey(summary.maskedKey);
+        setStoredKeyNeedsResave(summary.needsResave);
+      } finally {
+        if (active) {
+          setLoaded(true);
         }
       }
-      setLoaded(true);
     }
+
     loadKey();
+
+    return () => {
+      active = false;
+    };
   }, []);
 
   async function handleSave() {
     setSaving(true);
     try {
+      const trimmedKey = apiKey.trim();
+      if (!trimmedKey) {
+        toast.error("Enter an API key to save");
+        return;
+      }
+
+      const encryptedApiKey = await encryptAnthropicApiKey(trimmedKey);
       const res = await fetch("/api/user/settings", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ anthropic_api_key: apiKey.trim() }),
+        body: JSON.stringify({ encrypted_api_key: encryptedApiKey }),
       });
       if (res.ok) {
-        const data = await res.json();
+        await res.json();
         toast.success("API key saved");
         setApiKey("");
-        setMaskedKey(data.has_api_key ? "sk-ant-••••" : null);
+        setMaskedKey(maskAnthropicApiKey(trimmedKey));
+        setStoredKeyNeedsResave(false);
       } else {
         toast.error("Failed to save API key");
       }
@@ -1124,10 +1147,16 @@ function ApiKeyTab() {
   async function handleTest() {
     setTesting(true);
     try {
+      const resolvedApiKey = apiKey.trim() || await getStoredAnthropicApiKey();
+      if (!resolvedApiKey) {
+        toast.error("No API key configured. Add one in Settings.");
+        return;
+      }
+
       const res = await fetch("/api/enrich", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ test: true }),
+        body: JSON.stringify({ test: true, apiKey: resolvedApiKey }),
       });
       if (res.ok) {
         toast.success("API key is valid and working");
@@ -1135,8 +1164,10 @@ function ApiKeyTab() {
         const data = await res.json();
         toast.error(data.error || "API key test failed");
       }
-    } catch {
-      toast.error("Failed to test API key");
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to test API key"
+      );
     } finally {
       setTesting(false);
     }
@@ -1148,12 +1179,13 @@ function ApiKeyTab() {
       const res = await fetch("/api/user/settings", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ anthropic_api_key: null }),
+        body: JSON.stringify({ encrypted_api_key: null }),
       });
       if (res.ok) {
         toast.success("API key deleted");
         setApiKey("");
         setMaskedKey(null);
+        setStoredKeyNeedsResave(false);
       } else {
         toast.error("Failed to delete API key");
       }
@@ -1182,7 +1214,7 @@ function ApiKeyTab() {
           <div className="mt-2 flex items-start gap-2 rounded-md border border-yellow-500/50 bg-yellow-500/10 p-3 text-sm text-yellow-700 dark:text-yellow-400">
             <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
             <span>
-              <strong>Privacy notice:</strong> Your API key is stored server-side and sent to Anthropic for transaction enrichment. Transaction descriptions are temporarily decrypted and sent to the Anthropic API during enrichment. This is an exception to the zero-knowledge model — if you prefer full privacy, do not use this feature.
+              <strong>Privacy notice:</strong> Your API key is stored encrypted at rest. When you use enrichment, your browser decrypts the key and sends it, together with selected transaction descriptions, transiently through the app server to Anthropic. Family Finance does not persist those plaintext values. If you prefer full privacy, do not use this feature.
             </span>
           </div>
         </CardHeader>
@@ -1193,6 +1225,23 @@ function ApiKeyTab() {
               <div className="flex items-center gap-2">
                 <p className="text-sm text-muted-foreground font-mono">
                   Current key: {maskedKey}
+                </p>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 px-2 text-destructive hover:text-destructive hover:bg-destructive/10"
+                  onClick={handleDelete}
+                  disabled={deleting}
+                >
+                  <Trash2 className="mr-1 h-3 w-3" />
+                  {deleting ? "Deleting..." : "Delete"}
+                </Button>
+              </div>
+            )}
+            {storedKeyNeedsResave && !apiKey && (
+              <div className="flex items-center gap-2">
+                <p className="text-sm text-amber-700 dark:text-amber-400">
+                  Stored key uses an older format. Re-enter and save it once to keep using enrichment.
                 </p>
                 <Button
                   variant="ghost"

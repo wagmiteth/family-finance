@@ -41,9 +41,7 @@ export async function GET() {
       theme: settings.theme,
       updated_at: settings.updated_at,
       has_api_key: hasKey,
-      masked_api_key: hasKey
-        ? settings.encrypted_api_key.slice(0, 7) + "••••" + settings.encrypted_api_key.slice(-4)
-        : null,
+      encrypted_api_key: settings.encrypted_api_key,
     });
   } catch {
     return NextResponse.json(
@@ -81,9 +79,17 @@ export async function PATCH(request: Request) {
 
     if (body.theme !== undefined) updates.theme = body.theme;
 
-    // API key stored server-side (plaintext in DB, not zero-knowledge)
-    if ("anthropic_api_key" in body) {
-      updates.encrypted_api_key = body.anthropic_api_key || null;
+    if ("encrypted_api_key" in body) {
+      if (
+        body.encrypted_api_key !== null &&
+        typeof body.encrypted_api_key !== "string"
+      ) {
+        return NextResponse.json(
+          { error: "encrypted_api_key must be a string or null" },
+          { status: 400 }
+        );
+      }
+      updates.encrypted_api_key = body.encrypted_api_key || null;
     }
 
     const { data: settings, error } = await supabase

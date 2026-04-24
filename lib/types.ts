@@ -76,9 +76,10 @@ export interface MerchantRule {
   amount_max: number | null; // encrypted
   priority: number;
   is_learned: boolean;
-  rule_type: "auto_import" | "pattern"; // encrypted
+  rule_type: "auto_import" | "pattern" | "exclude"; // encrypted
   match_transaction_type: string | null; // encrypted
   notes: string | null; // encrypted
+  owner_user_id: string | null;
   created_at: string;
 }
 
@@ -139,7 +140,6 @@ export interface SettlementBatch {
 export interface Settlement {
   id: string;
   household_id: string;
-  settlement_hash: string;
   month: string; // encrypted
   from_user_id: string | null; // encrypted
   to_user_id: string | null; // encrypted
@@ -161,7 +161,7 @@ export interface Settlement {
 export interface UserSettings {
   user_id: string;
   has_api_key: boolean;
-  masked_api_key: string | null;
+  encrypted_api_key: string | null;
   theme: string;
   updated_at: string;
 }
@@ -215,6 +215,7 @@ export interface RawMerchantRule {
   category_id: string | null;
   priority: number;
   is_learned: boolean;
+  owner_user_id: string | null;
   encrypted_data: string | null;
   created_at: string;
 }
@@ -222,7 +223,6 @@ export interface RawMerchantRule {
 export interface RawSettlement {
   id: string;
   household_id: string;
-  settlement_hash: string;
   is_settled: boolean;
   settled_at: string | null;
   encrypted_data: string | null;
@@ -245,6 +245,8 @@ export interface ParsedTransaction {
   account_name?: string;
   import_hash?: string;
   isDuplicate?: boolean;
+  isExcluded?: boolean;
+  excludeRuleId?: string;
   autoCategory?: string | null;
 }
 
