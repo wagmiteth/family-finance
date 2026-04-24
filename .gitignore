@@ -43,3 +43,7 @@ supabase/.temp/
 
 # claude code local settings
 .claude/settings.local.json
+.claude/launch.json
+
+# playwright mcp console logs
+.playwright-mcp/
