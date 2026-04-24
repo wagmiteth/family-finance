@@ -1,5 +1,11 @@
 [
   {
+    "_comment": "Only description, date (YYYY-MM-DD), and amount are required. Remove this _comment field and any optional keys you don't need. All fields below the first object are optional.",
+    "description": "Minimum example — only required fields",
+    "date": "2025-01-10",
+    "amount": -99.00
+  },
+  {
     "description": "ICA Maxi Lindhagen",
     "date": "2025-01-15",
     "amount": -523.50,

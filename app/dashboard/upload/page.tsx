@@ -1270,7 +1270,8 @@ export default function UploadPage() {
           </CardHeader>
           <CardContent className="space-y-3">
             <p className="text-xs text-muted-foreground leading-relaxed">
-              Generate your own file using our template. Required fields: <strong>description</strong>, <strong>date</strong>, and <strong>amount</strong>. All other fields are optional.
+              Generate your own file using our template. Only three fields are
+              mandatory — everything else is optional and can be left blank.
             </p>
             <div className="flex flex-wrap gap-2">
               <a
@@ -1290,9 +1291,18 @@ export default function UploadPage() {
                 JSON template
               </a>
             </div>
-            <div className="text-[11px] text-muted-foreground space-y-1">
-              <p><strong>Required columns:</strong> description, date (YYYY-MM-DD), amount</p>
-              <p><strong>Optional:</strong> transaction_type, category, subcategory, tags, notes, bank_name, account_number, account_name</p>
+            <div className="rounded-md border bg-muted/40 p-2.5 text-[11px] space-y-1.5">
+              <p className="text-foreground">
+                <span className="font-semibold">Mandatory:</span>{" "}
+                <code className="rounded bg-background px-1 py-0.5 font-mono">description</code>,{" "}
+                <code className="rounded bg-background px-1 py-0.5 font-mono">date</code>{" "}
+                <span className="text-muted-foreground">(YYYY-MM-DD)</span>,{" "}
+                <code className="rounded bg-background px-1 py-0.5 font-mono">amount</code>
+              </p>
+              <p className="text-muted-foreground">
+                <span className="font-semibold text-foreground">Optional:</span>{" "}
+                transaction_type, category, subcategory, tags, notes, bank_name, account_number, account_name
+              </p>
             </div>
           </CardContent>
         </Card>

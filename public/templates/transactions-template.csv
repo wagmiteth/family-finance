@@ -1,4 +1,5 @@
 description,date,amount,transaction_type,category,subcategory,tags,notes,bank_name,account_number,account_name
+"Minimum example — required columns only","2025-01-10",-99.00,,,,,,,,
 "ICA Maxi Lindhagen","2025-01-15",-523.50,"expense","Groceries","Food","groceries,weekly","Weekly shopping","Nordea","1234-567890","Privatkonto"
 "Spotify Premium","2025-01-15",-129.00,"expense","Subscriptions","Entertainment","subscription",,"SEB","9876-543210","Lönekonto"
-"Lön Januari","2025-01-25",35000.00,"income","Salary",,,,,"Nordea","1234-567890","Privatkonto"
+"Lön Januari","2025-01-25",35000.00,"income","Salary",,,,"Nordea","1234-567890","Privatkonto"
