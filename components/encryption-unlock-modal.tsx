@@ -1,7 +1,9 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { useEncryption } from "@/lib/crypto/encryption-context";
+import { createClient } from "@/lib/supabase/client";
 import {
   Dialog,
   DialogContent,
@@ -15,9 +17,11 @@ import { Label } from "@/components/ui/label";
 import { toast } from "sonner";
 
 export function EncryptionUnlockModal() {
-  const { isUnlocked, isRestoring, unlock } = useEncryption();
+  const router = useRouter();
+  const { isUnlocked, isRestoring, unlock, lock } = useEncryption();
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
 
   // Don't show if still restoring or already unlocked
   if (isRestoring || isUnlocked) return null;
@@ -34,6 +38,20 @@ export function EncryptionUnlockModal() {
       );
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleLogout() {
+    if (loggingOut) return;
+    setLoggingOut(true);
+    try {
+      lock();
+      const supabase = createClient();
+      await supabase.auth.signOut();
+      router.push("/login");
+    } catch {
+      toast.error("Could not log out. Please try again.");
+      setLoggingOut(false);
     }
   }
 
@@ -58,12 +76,28 @@ export function EncryptionUnlockModal() {
               onChange={(e) => setPassword(e.target.value)}
               required
               autoFocus
+              disabled={loading || loggingOut}
             />
           </div>
-          <Button type="submit" className="w-full" disabled={loading}>
+          <Button
+            type="submit"
+            className="w-full"
+            disabled={loading || loggingOut}
+          >
             {loading ? "Unlocking..." : "Unlock"}
           </Button>
         </form>
+        <div className="pt-2 text-center text-xs text-muted-foreground">
+          Forgot your password or using the wrong account?{" "}
+          <button
+            type="button"
+            onClick={handleLogout}
+            disabled={loading || loggingOut}
+            className="font-medium text-foreground underline underline-offset-2 hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {loggingOut ? "Logging out…" : "Log out"}
+          </button>
+        </div>
       </DialogContent>
     </Dialog>
   );
