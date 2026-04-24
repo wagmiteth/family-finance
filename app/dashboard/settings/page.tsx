@@ -76,6 +76,7 @@ import {
   maskAnthropicApiKey,
 } from "@/lib/crypto/anthropic-api-key";
 import { getDEK } from "@/lib/crypto/key-store";
+import { useDecryptedFetch } from "@/lib/crypto/use-decrypted-fetch";
 import { InviteBanner } from "@/components/invite-banner";
 
 export default function SettingsPageWrapper() {

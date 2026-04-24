@@ -2156,7 +2156,6 @@ export default function SettlementsPage() {
         onClose={() => setPaymentDialogOpen(false)}
         transactions={transactions}
         monthlyViews={monthlyViews}
-        participants={participants}
         onConfirm={handleApplySettlementPayment}
         busy={applyingPayment}
       />
