@@ -41,6 +41,12 @@ const ZLANTAR_CSV_HEADERS: Record<string, string> = {
 const ZLANTAR_REQUIRED_COLUMNS = ["beskrivning", "datum", "belopp"];
 const ZLANTAR_REQUIRED_COLUMNS_EN = ["description", "date", "amount"];
 
+// Users can mark required columns with a trailing `*` in the CSV header
+// (e.g. `description*`) for readability. Strip it before matching.
+function stripRequiredMarker(header: string): string {
+  return header.replace(/\*+$/, "").trim();
+}
+
 // --- Format Detection ---
 
 function detectFileFormat(content: string, fileName: string): FileFormat {
@@ -80,7 +86,9 @@ function detectFileFormat(content: string, fileName: string): FileFormat {
   if (fileName.endsWith(".csv") || !trimmed.startsWith("{")) {
     const firstLine = trimmed.split("\n")[0].toLowerCase();
     const delimiter = firstLine.includes(";") ? ";" : ",";
-    const headers = firstLine.split(delimiter).map((h) => h.trim());
+    const headers = firstLine
+      .split(delimiter)
+      .map((h) => stripRequiredMarker(h));
 
     // Zlantar CSV: has Swedish column names
     const hasZlantarSv = ZLANTAR_REQUIRED_COLUMNS.every((col) =>
@@ -113,7 +121,7 @@ function parseZlantarCSV(content: string): ParsedTransaction[] {
     delimiter,
     skipEmptyLines: true,
     transformHeader: (header: string) => {
-      const cleaned = header.trim().toLowerCase();
+      const cleaned = stripRequiredMarker(header).toLowerCase();
       return ZLANTAR_CSV_HEADERS[cleaned] || cleaned;
     },
   });
@@ -279,7 +287,7 @@ function parseBankCSV(content: string): ParsedTransaction[] {
     delimiter,
     skipEmptyLines: true,
     transformHeader: (header: string) => {
-      const cleaned = header.trim().toLowerCase().replace(/"/g, "");
+      const cleaned = stripRequiredMarker(header.replace(/"/g, "")).toLowerCase();
       return BANK_CSV_COLUMN_MAP[cleaned] || cleaned;
     },
   });

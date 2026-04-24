@@ -1271,7 +1271,12 @@ export default function UploadPage() {
           <CardContent className="space-y-3">
             <p className="text-xs text-muted-foreground leading-relaxed">
               Generate your own file using our template. Only three fields are
-              mandatory — everything else is optional and can be left blank.
+              mandatory — in the CSV they&apos;re marked with a{" "}
+              <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">*</code>{" "}
+              in the header (e.g.{" "}
+              <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">description*</code>
+              ). The <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">*</code>{" "}
+              is stripped automatically on import, so you can leave it in or take it out.
             </p>
             <div className="flex flex-wrap gap-2">
               <a
@@ -1294,10 +1299,10 @@ export default function UploadPage() {
             <div className="rounded-md border bg-muted/40 p-2.5 text-[11px] space-y-1.5">
               <p className="text-foreground">
                 <span className="font-semibold">Mandatory:</span>{" "}
-                <code className="rounded bg-background px-1 py-0.5 font-mono">description</code>,{" "}
-                <code className="rounded bg-background px-1 py-0.5 font-mono">date</code>{" "}
+                <code className="rounded bg-background px-1 py-0.5 font-mono">description*</code>,{" "}
+                <code className="rounded bg-background px-1 py-0.5 font-mono">date*</code>{" "}
                 <span className="text-muted-foreground">(YYYY-MM-DD)</span>,{" "}
-                <code className="rounded bg-background px-1 py-0.5 font-mono">amount</code>
+                <code className="rounded bg-background px-1 py-0.5 font-mono">amount*</code>
               </p>
               <p className="text-muted-foreground">
                 <span className="font-semibold text-foreground">Optional:</span>{" "}
